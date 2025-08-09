@@ -18,4 +18,4 @@ pip install -r requirements.txt
 cp .env.example .env
 # Open .env and paste your keys (never commit them)
 # Put your Zem Labs logo at assets/logo.png
-streamlit run app.py
+streamlit run app.py# Noah-api

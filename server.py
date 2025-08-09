@@ -12,6 +12,15 @@ from noah_core import (
 
 app = FastAPI(title="Noah API", version="1.0.0")
 
+@app.get("/", include_in_schema=False)
+def root():
+    return {
+        "message": "Noah API is running!",
+        "version": "1.0.0",
+        "endpoints": ["/health", "/generate", "/download/{name}"],
+        "docs": "/docs"
+    }
+    
 # ---- CORS (allow your site to call the API) ----
 # Set ALLOWED_ORIGINS="https://yourdomain.com,https://www.yourdomain.com"
 allowed = os.getenv("ALLOWED_ORIGINS", "*")
@@ -23,7 +32,7 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
-
+    
 @app.get("/health")
 def health():
     """Simple health check; returns {'ok': True} if keys are loaded."""

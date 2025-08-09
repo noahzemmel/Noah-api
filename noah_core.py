@@ -1,255 +1,382 @@
-# noah_core.py
-import io, os, re, math, time, json
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict
-from urllib.parse import quote_plus
-from pathlib import Path
+# noah_core.py — Core generation + exact-length audio for Noah API
+# ------------------------------------------------------------------------------------
+# Requirements:
+# - openai>=1.30
+# - requests, feedparser, pydub
+# - ffmpeg installed (Dockerfile already does apt-get install ffmpeg)
+#
+# Environment variables (set on the API service in Render):
+#   OPENAI_API_KEY
+#   ELEVENLABS_API_KEY
+#   ELEVENLABS_VOICE_ID (optional default)
+# ------------------------------------------------------------------------------------
 
+import io
+import os
+import re
+import math
+import time
+import json
+import uuid
+import shutil
+import random
+import string
 import feedparser
 import requests
+from typing import Dict, List, Any, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+
 from pydub import AudioSegment
-from dotenv import load_dotenv, find_dotenv
 
-# ---------- constants ----------
-WPM_DEFAULT = 170
-WORDS_PER_ITEM = 90
-INTRO_MS = 350
-OUTRO_MS = 650
-CHUNK_MAX_CHARS = 2500
+# OpenAI v1 SDK
+from openai import OpenAI
 
-# ---------- robust env ----------
-env_path = find_dotenv(usecwd=True) or str((Path(__file__).parent / ".env").resolve())
-load_dotenv(dotenv_path=env_path)
+# --------------------------- Config -------------------------------------------
+
+DATA_DIR = os.getenv("NOAH_DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 
-# ---------- OpenAI client ----------
-from openai import OpenAI
-oai = OpenAI()  # reads OPENAI_API_KEY from env
+# speech tempo guardrails for exact fit (atempo supports 0.5–2.0 per stage)
+MIN_RATE = 0.85
+MAX_RATE = 1.25
 
-# ---------- helpers ----------
-def clean_text(t: str) -> str:
-    import re
-    return re.sub(r"\s+", " ", (t or "")).strip()
+# Conservative words-per-second for natural TTS (English ~2.4–3.2). We use 2.6.
+DEFAULT_WPS = float(os.getenv("NOAH_WORDS_PER_SECOND", "2.6"))
 
-def minutes_to_words(minutes: int, wpm: int = WPM_DEFAULT) -> int:
-    return max(60, int(minutes * max(90, min(240, wpm))))
-
-def count_words(text: str) -> int:
-    import re
-    return len(re.findall(r"\b\w+\b", text or ""))
-
-def google_news_rss(query: str, lang_ceid: str = "US:en") -> str:
-    from urllib.parse import quote_plus
-    q = quote_plus(query)
-    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid={lang_ceid}"
-
-def youtube_search_rss(query: str) -> str:
-    q = quote_plus(query)
-    return f"https://www.youtube.com/feeds/videos.xml?search_query={q}"
-
-def arxiv_search_rss(query: str) -> str:
-    q = quote_plus(query)
-    return f"http://export.arxiv.org/api/query?search_query=all:{q}&sortBy=submittedDate&sortOrder=descending"
-
-LANG_TO_CEID = {
-    "English": "US:en", "Spanish": "ES:es", "French": "FR:fr", "German": "DE:de",
-    "Italian": "IT:it", "Portuguese": "PT:pt", "Arabic": "AE:ar", "Hindi": "IN:hi",
-    "Japanese": "JP:ja", "Korean": "KR:ko", "Chinese (Simplified)": "CN:zh-Hans",
+# Intro/outro (localizable by language)
+DEFAULT_INTRO = {
+    "English": "Welcome to your daily Noah.",
+}
+DEFAULT_OUTRO = {
+    "English": "That's your Noah for today. See you tomorrow.",
 }
 
-def build_urls_for_query(query: str, language: str) -> list:
-    ceid = LANG_TO_CEID.get(language, "US:en")
-    return [google_news_rss(query, lang_ceid=ceid), youtube_search_rss(query), arxiv_search_rss(query)]
-
-def fetch_items_from_urls(urls: list, per_feed: int, recent_hours: int) -> list:
-    """Fetch strictly within last N hours; dedup; newest first."""
-    items = []
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=recent_hours)
-    for url in urls:
-        try:
-            parsed = feedparser.parse(url)
-            source_title = parsed.feed.get("title", url)
-            for e in parsed.entries:
-                ts = None
-                if getattr(e, "published_parsed", None):
-                    ts = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-                elif getattr(e, "updated_parsed", None):
-                    ts = datetime(*e.updated_parsed[:6], tzinfo=timezone.utc)
-                if not ts or ts < cutoff:
-                    continue
-                title = clean_text(getattr(e, "title", ""))
-                summary = clean_text(getattr(e, "summary", "") or getattr(e, "description", ""))
-                link = getattr(e, "link", "")
-                items.append({
-                    "title": title, "summary": summary, "link": link,
-                    "published_dt": ts, "published": ts.isoformat(), "source": source_title,
-                })
-        except Exception:
-            continue
-    items.sort(key=lambda x: x["published_dt"], reverse=True)
-    seen, unique = set(), []
-    for it in items:
-        k = it["title"].lower()
-        if k not in seen:
-            unique.append(it); seen.add(k)
-    return unique[:per_feed]
-
-def collect_items_for_queries(queries: list, language: str, per_feed: int, recent_hours: int, cap_per_query: int) -> dict:
-    result = {}
-    for q in queries:
-        urls = build_urls_for_query(q, language)
-        collected = fetch_items_from_urls(urls, per_feed=per_feed * len(urls), recent_hours=recent_hours)
-        result[q] = collected[:cap_per_query]
-    return result
-
-def llm_summarize_and_script(topics_map: Dict[str, List[Dict]], language: str, total_minutes: int, tone: str) -> Dict:
-    """Breaking‑news script; ONLY uses provided items."""
-    target_words = minutes_to_words(total_minutes, WPM_DEFAULT)
-    lower, upper = int(target_words*0.95), int(target_words*1.05)
-    newsroom_rules = (
-        "- Use only the provided items; no extra facts.\n"
-        "- Focus on last 24–48h updates. Use time words (today/UTC).\n"
-        "- Lead with who/what/where/when/how many. Use numbers and names.\n"
-        "- Short sentences ≤ 18 words. No filler. Minimal transitions.\n"
-        "- Attribute outlets briefly by name. No URLs.\n"
-        "- End with one‑sentence wrap‑up."
-    )
-    sys = (f"You are Noah, a breaking‑news editor and narrator. "
-           f"SPOKEN {language}. Total length {lower}–{upper} words. Tone: {tone}. "
-           f"Be information‑dense and concise.\nRULES:\n{newsroom_rules}")
-    ref_lines = []
-    for query, items in topics_map.items():
-        for it in items:
-            ref_lines.append(f"[{query}] • {it['published']} • {it['source']} • {it['title']} • {it['summary'][:400]}")
-    user = f"""Tasks:
-1) Compact bullet list grouped by query (STRICTLY from these items).
-2) Single narration in {language} of {lower}–{upper} words following the RULES.
-
-ITEMS:
-{os.linesep.join(ref_lines)}
-"""
-    resp = oai.chat.completions.create(
-        model="gpt-4o-mini", temperature=0.2,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-    )
-    content = (resp.choices[0].message.content or "").strip()
-    bullets_section, script_section, in_script = [], [], False
-    for line in content.splitlines():
-        if re.match(r"^\s*(Script|Narration)\b", line, re.I):
-            in_script = True; continue
-        (script_section if in_script else bullets_section).append(line)
-    bullets_text = "\n".join(bullets_section).strip()
-    script_text = "\n".join(script_section).strip() or content
-    return {"bullets": bullets_text, "script": script_text, "target_words": target_words}
-
-def tighten_to_word_target(script: str, target_words: int, language: str) -> str:
-    """Refine to ±2–5% of target words, keep facts."""
-    def within(text: str, pct: float) -> bool:
-        return abs(count_words(text) - target_words) <= int(target_words * pct)
-    for _ in range(2):
-        if within(script, 0.05): break
-        direction = "condense to" if count_words(script) > target_words else "expand to"
-        prompt = (f"Rewrite the narration in {language} to {direction} ~{target_words} words (±2%). "
-                  f"Short sentences ≤18 words. Keep facts and flow. No headings. Return only text.")
-        r = oai.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.1,
-            messages=[{"role":"system","content":"You are a precise editor."},
-                      {"role":"user","content":prompt+"\n\n---\n"+script}]
-        )
-        script = (r.choices[0].message.content or "").strip()
-    return script
-
-def make_intro_outro(language: str) -> tuple[str,str]:
-    prompt = (f"Write two very short spoken lines in {language} for a daily news podcast Noah by Zem Labs. "
-              f"Line1: friendly 2–3s welcome (≤12 words). "
-              f"Line2: friendly 2–3s goodbye for tomorrow (≤12 words). "
-              f"Return JSON with 'intro' and 'outro'.")
-    try:
-        r = oai.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.3,
-            messages=[{"role":"system","content":"You are a concise copywriter."},
-                      {"role":"user","content":prompt}]
-        )
-        j = json.loads(r.choices[0].message.content)
-        return (clean_text(j.get("intro") or "Welcome to your daily Noah by Zem Labs."),
-                clean_text(j.get("outro") or "Thanks for listening — see you tomorrow."))
-    except Exception:
-        return ("Welcome to your daily Noah by Zem Labs.",
-                "Thanks for listening — see you tomorrow.")
-
-# ---------- ElevenLabs ----------
-def elevenlabs_tts(text: str, voice_id: str, model_id: str = "eleven_multilingual_v2") -> AudioSegment:
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    payload = {"text": text, "model_id": model_id, "voice_settings": {"stability":0.4,"similarity_boost":0.7}}
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
-    r = requests.post(url, headers=headers, json=payload, timeout=180)
-    r.raise_for_status()
-    return AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
-
-def chunk_script_for_tts(text: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
-    text = (text or "").strip()
-    if len(text) <= max_chars: return [text]
-    import re
-    parts = re.split(r"(\n\n+|[.!?] )", text)
-    chunks, buf = [], ""
-    for p in parts:
-        if len(buf) + len(p) < max_chars: buf += p
-        else: chunks.append(buf.strip()); buf = p
-    if buf.strip(): chunks.append(buf.strip())
-    return chunks
-
-# ---------- main orchestration ----------
-def make_noah_audio(
-    queries: List[str],
-    language: str = "English",
-    tone: str = "neutral and calm",
-    recent_hours: int = 24,
-    per_feed: int = 6,
-    cap_per_query: int = 6,
-    min_minutes: int = 8,
-    voice_id: str = "",
-) -> dict:
-    if not voice_id:
-        voice_id = DEFAULT_VOICE_ID or ""
-    if not voice_id:
-        raise RuntimeError("No ElevenLabs voice_id provided and ELEVENLABS_VOICE_ID env var is empty.")
-
-    topic_items = collect_items_for_queries(queries, language, per_feed, recent_hours, cap_per_query)
-    used_items = {q: list(v) for q, v in topic_items.items()}
-    total_items = sum(len(v) for v in used_items.values())
-    effective_minutes = max(min_minutes, math.ceil((total_items * WORDS_PER_ITEM) / WPM_DEFAULT))
-
-    res = llm_summarize_and_script(used_items, language, effective_minutes, tone)
-    script = tighten_to_word_target(res["script"], res["target_words"], language)
-    intro, outro = make_intro_outro(language)
-
-    silence_short = AudioSegment.silent(duration=INTRO_MS)
-    silence_long  = AudioSegment.silent(duration=OUTRO_MS)
-
-    intro_audio = elevenlabs_tts(intro, voice_id=voice_id)
-    parts = [elevenlabs_tts(c, voice_id=voice_id) for c in chunk_script_for_tts(script)]
-    if not parts:
-        parts = [AudioSegment.silent(duration=300)]
-    main_audio = sum(parts[1:], parts[0])
-    outro_audio = elevenlabs_tts(outro, voice_id=voice_id)
-
-    full = intro_audio + silence_short + main_audio + silence_long + outro_audio
-
-    outdir = Path("out"); outdir.mkdir(exist_ok=True)
-    fname = outdir / f"noah_{int(time.time())}.mp3"
-    full.export(str(fname), format="mp3", bitrate="192k")
-
-    return {
-        "bullet_points": res["bullets"],
-        "script": script,
-        "sources": used_items,
-        "minutes_target": effective_minutes,
-        "duration_seconds": len(full)/1000.0,
-        "file_path": str(fname),
-        "file_name": fname.name,
-    }
+# ------------------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------------------
 
 def health_check() -> bool:
-    return bool(OPENAI_API_KEY and ELEVENLABS_API_KEY)
+    return bool(OPENAI_API_KEY and ELEVEN_API_KEY)
+
+def _slug(n: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", n.strip()).strip("-").lower()
+    return s or "noah"
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _safe_get(d: dict, key: str, default=""):
+    v = d.get(key, default)
+    return v if v is not None else default
+
+# ------------------------------------------------------------------------------
+# News fetching (Google News RSS per query, recent hours filter)
+# ------------------------------------------------------------------------------
+
+def _google_news_rss(query: str, recent_hours: int) -> str:
+    q = requests.utils.quote(query)
+    when = f" when:{recent_hours}h" if recent_hours else ""
+    # English world feed; adjust as needed
+    return f"https://news.google.com/rss/search?q={q}{requests.utils.quote(when)}&hl=en-GB&gl=GB&ceid=GB:en"
+
+def fetch_sources_for_query(query: str, recent_hours: int, cap: int) -> List[Dict[str, str]]:
+    url = _google_news_rss(query, recent_hours)
+    try:
+        parsed = feedparser.parse(url)
+    except Exception:
+        return []
+    items = []
+    for e in parsed.entries[: cap * 3]:  # pull extra, we'll dedupe
+        title = _safe_get(e, "title", "")
+        link = _safe_get(e, "link", "")
+        source = _safe_get(e, "source", {}).get("title", "")
+        if not source and "source" in e:
+            source = str(e["source"])
+        if title and link:
+            items.append({"title": title, "link": link, "source": source})
+    # de‑dupe by link
+    uniq = []
+    seen = set()
+    for it in items:
+        k = it["link"]
+        if k not in seen:
+            uniq.append(it)
+            seen.add(k)
+        if len(uniq) >= cap:
+            break
+    return uniq
+
+def collect_sources(queries: List[str], recent_hours: int, cap_per_query: int) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for q in queries:
+        out[q] = fetch_sources_for_query(q, recent_hours, cap_per_query)
+    return out
+
+# ------------------------------------------------------------------------------
+# Script + bullets with strict word budgeting
+# ------------------------------------------------------------------------------
+
+def compute_word_budget(minutes_target: int, wps: float, intro_words: int, outro_words: int) -> Tuple[int, int, int]:
+    """
+    Returns (total_budget, budget_for_body, per_story_hint)
+    """
+    total_seconds = max(1, int(minutes_target * 60))
+    total_budget = max(60, int(total_seconds * wps))  # never below 60 words
+    body_budget = max(20, total_budget - intro_words - outro_words)
+    per_story_hint = max(30, int(body_budget / 6))  # hint used in prompt; AI can rebalance
+    return total_budget, body_budget, per_story_hint
+
+def count_words(s: str) -> int:
+    return len(re.findall(r"\b\w+\b", s))
+
+def openai_client() -> OpenAI:
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+def build_prompt(language: str, tone: str, queries: List[str], sources: Dict[str, List[Dict[str, str]]],
+                 total_budget: int, per_story_hint: int, intro_text: str, outro_text: str) -> List[Dict[str,str]]:
+    """
+    Returns messages for Chat Completions with hard constraints.
+    """
+    # Minimal source pack to include inline
+    source_snippets = []
+    for q, items in sources.items():
+        source_snippets.append(f"Topic: {q}")
+        for it in items:
+            source_snippets.append(f"- {it.get('title','')} ({it.get('source','')}) <{it.get('link','')}>")
+    src_text = "\n".join(source_snippets[: 120])  # keep prompt bounded
+
+    system = (
+        "You are Noah, a concise news editor.\n"
+        "You must produce:\n"
+        " 1) A compact bullet list of the most important, *fresh* items.\n"
+        " 2) A narration script suitable for voiceover.\n\n"
+        "Hard requirements:\n"
+        f"- TOTAL narration words (INCLUDING intro/outro) must be ≤ {total_budget} words.\n"
+        "- Focus on items from the provided sources; do not invent facts.\n"
+        "- Keep it timely: prefer items within the last 24–48 hours.\n"
+        "- Use short, concrete sentences. Avoid background history unless needed for context.\n"
+        "- Include the intro line at the start and the outro line at the end exactly as provided.\n"
+    )
+    user = (
+        f"Language: {language}\n"
+        f"Tone: {tone}\n"
+        "Intro:\n"
+        f"{intro_text}\n\n"
+        "Outro:\n"
+        f"{outro_text}\n\n"
+        "Queries:\n"
+        + "\n".join([f"- {q}" for q in queries]) + "\n\n"
+        "Sources to rely on:\n"
+        f"{src_text}\n\n"
+        f"Per-story narration hint: ~{per_story_hint} words on average (rebalance as needed).\n"
+        "Return JSON with fields:\n"
+        "{\n"
+        '  "bullets": "markdown bullet list",\n'
+        '  "narration": "final narration text including intro & outro"\n'
+        "}\n"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+def generate_script_and_bullets(queries: List[str], language: str, tone: str,
+                                sources: Dict[str, List[Dict[str, str]]],
+                                minutes_target: int, wps: float,
+                                intro_text: str, outro_text: str) -> Tuple[str, str]:
+    total_budget, body_budget, per_story_hint = compute_word_budget(minutes_target, wps, count_words(intro_text), count_words(outro_text))
+
+    client = openai_client()
+
+    for attempt in range(3):
+        msgs = build_prompt(language, tone, queries, sources, total_budget, per_story_hint, intro_text, outro_text)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=msgs,
+        )
+        content = resp.choices[0].message.content.strip()
+
+        # Extract JSON
+        try:
+            j = json.loads(content)
+            bullets = j.get("bullets", "").strip()
+            narration = j.get("narration", "").strip()
+        except Exception:
+            # try to salvage with regex codeblock
+            m = re.search(r"\{.*\}", content, re.S)
+            if not m:
+                continue
+            try:
+                j = json.loads(m.group(0))
+                bullets = j.get("bullets", "").strip()
+                narration = j.get("narration", "").strip()
+            except Exception:
+                continue
+
+        # Enforce budget by compressing if necessary
+        words = count_words(narration)
+        if words <= total_budget:
+            return bullets, narration
+
+        # Ask model to compress to the exact budget
+        compress_target = max(60, total_budget)
+        resp2 = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role":"system","content":"Compress the narration to fit the word budget without losing facts or names."},
+                {"role":"user","content":f"Word budget: {compress_target}\nKeep language: {language}\nKeep tone: {tone}\nText:\n{narration}\nReturn ONLY the compressed narration text, nothing else."}
+            ],
+        )
+        narration2 = resp2.choices[0].message.content.strip()
+        if count_words(narration2) <= total_budget:
+            return bullets, narration2
+        # else loop again with smaller hints (reduce wps a bit)
+        wps = wps * 0.97
+
+    # Fallback: truncate gently
+    toks = narration.split()
+    narration = " ".join(toks[: total_budget])
+    return bullets, narration
+
+# ------------------------------------------------------------------------------
+# Text-to-speech (ElevenLabs)
+# ------------------------------------------------------------------------------
+
+def tts_eleven(text: str, voice_id: Optional[str], language: str) -> str:
+    """
+    Sends text to ElevenLabs, returns path to MP3 file on disk.
+    """
+    vid = voice_id or DEFAULT_VOICE_ID
+    if not vid:
+        raise RuntimeError("No ElevenLabs voice_id provided and ELEVENLABS_VOICE_ID is not set.")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
+    headers = {
+        "xi-api-key": ELEVEN_API_KEY,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.55,
+            "similarity_boost": 0.75,
+            "style": 0.25,
+            "use_speaker_boost": True
+        }
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=600)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text}")
+
+    fname = f"noah_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
+    fpath = os.path.join(DATA_DIR, fname)
+    with open(fpath, "wb") as f:
+        f.write(r.content)
+    return fpath
+
+def audio_duration_seconds(path: str) -> float:
+    seg = AudioSegment.from_file(path)
+    return float(len(seg) / 1000.0)
+
+def tempo_adjust_to_exact(input_path: str, target_seconds: int) -> Tuple[str, float]:
+    """
+    Uses ffmpeg atempo to adjust playback rate to hit target_seconds.
+    Returns (output_path, applied_rate). If no change needed, returns original path and 1.0.
+    """
+    actual = audio_duration_seconds(input_path)
+    if actual <= 0 or target_seconds <= 0:
+        return input_path, 1.0
+
+    desired_rate = actual / float(target_seconds)
+    rate = max(MIN_RATE, min(MAX_RATE, desired_rate))
+
+    # If change is tiny (<2%) skip re-encoding
+    if abs(rate - 1.0) < 0.02:
+        return input_path, 1.0
+
+    out_path = input_path.replace(".mp3", "_exact.mp3")
+    # ffmpeg's atempo only accepts 0.5–2.0. Our clamps ensure we're safe.
+    cmd = f'ffmpeg -y -i "{input_path}" -filter:a "atempo={rate:.6f}" -vn "{out_path}"'
+    code = os.system(cmd)
+    if code != 0 or not os.path.exists(out_path):
+        # If ffmpeg failed, fall back to original
+        return input_path, 1.0
+    return out_path, rate
+
+# ------------------------------------------------------------------------------
+# Public API method
+# ------------------------------------------------------------------------------
+
+def make_noah_audio(
+    queries: List[str],
+    language: str,
+    tone: str,
+    recent_hours: int,
+    per_feed: int,
+    cap_per_query: int,
+    minutes_target: int,
+    exact_minutes: bool = True,
+    voice_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    End-to-end: fetch sources -> generate bullets/script with budget -> TTS -> (optional) tempo adjust
+    Returns:
+      {
+        "bullet_points": "...",
+        "script": "...",
+        "sources": {...},
+        "file_path": "/app/data/noah_xxx.mp3",
+        "duration_seconds": 480.2,
+        "minutes_target": 8,
+        "playback_rate_applied": 1.0,
+      }
+    """
+    intro = DEFAULT_INTRO.get(language, DEFAULT_INTRO["English"])
+    outro = DEFAULT_OUTRO.get(language, DEFAULT_OUTRO["English"])
+
+    # 1) Gather sources
+    sources = collect_sources(queries, recent_hours, cap_per_query)
+
+    # 2) Word-budgeted script
+    bullets, narration = generate_script_and_bullets(
+        queries=queries,
+        language=language,
+        tone=tone,
+        sources=sources,
+        minutes_target=minutes_target,
+        wps=DEFAULT_WPS,
+        intro_text=intro,
+        outro_text=outro,
+    )
+
+    # 3) TTS
+    mp3_path = tts_eleven(narration, voice_id=voice_id, language=language)
+    duration = audio_duration_seconds(mp3_path)
+
+    # 4) Exact-length adjustment (server-side)
+    applied_rate = 1.0
+    if exact_minutes:
+        target_seconds = max(1, int(minutes_target * 60))
+        adj_path, applied_rate = tempo_adjust_to_exact(mp3_path, target_seconds)
+        if adj_path != mp3_path:
+            mp3_path = adj_path
+            duration = audio_duration_seconds(mp3_path)
+
+    return {
+        "bullet_points": bullets,
+        "script": narration,
+        "sources": sources,
+        "file_path": mp3_path,
+        "duration_seconds": duration,
+        "minutes_target": minutes_target,
+        "playback_rate_applied": applied_rate,
+        "generated_at": _now_iso(),
+    }

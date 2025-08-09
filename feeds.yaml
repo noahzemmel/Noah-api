@@ -1,0 +1,32 @@
+topics:
+  World:
+    - https://feeds.bbci.co.uk/news/world/rss.xml
+    - https://rss.cnn.com/rss/edition_world.rss
+    - https://www.aljazeera.com/xml/rss/all.xml
+  Business:
+    - https://feeds.bbci.co.uk/news/business/rss.xml
+    - https://www.ft.com/?format=rss
+    - https://www.economist.com/finance-and-economics/rss.xml
+  Technology:
+    - https://www.theverge.com/rss/index.xml
+    - https://feeds.arstechnica.com/arstechnica/index/
+    - https://www.wired.com/feed/rss
+  Science:
+    - https://www.science.org/rss/news_current.xml
+    - https://www.nature.com/subjects/science/rss
+    - https://www.nasa.gov/rss/dyn/breaking_news.rss
+  Crypto:
+    - https://www.coindesk.com/arc/outboundfeeds/rss/
+    - https://cointelegraph.com/rss
+  Health:
+    - https://www.cdc.gov/media/rss.htm
+    - https://www.who.int/feeds/entity/mediacentre/news/en/rss.xml
+  Sports:
+    - https://www.espn.com/espn/rss/news
+    - https://www.skysports.com/rss/12040
+  Entertainment:
+    - https://variety.com/feed/
+    - https://www.hollywoodreporter.com/c/news/feed/
+  Politics:
+    - https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+    - https://www.politico.com/rss/politics08.xml

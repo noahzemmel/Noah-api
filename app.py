@@ -2,13 +2,11 @@
 import os, time, json, requests, streamlit as st
 from typing import List, Dict, Any
 
-# ---- Config
 API_BASE = os.getenv("API_BASE", "").rstrip("/")  # e.g., https://thenoah.onrender.com
 APP_TITLE = "Noah — Daily Smart Bulletins"
 
 ACCENT="#2563EB"; FG="#E8EDF7"; FG_MUTED="#C7D2FE"; BG="#0B1220"; CARD="#0F172A"; BORDER="#1F2A44"
 st.set_page_config(page_title="Noah • Zem Labs", page_icon="🎧", layout="wide")
-
 st.markdown(f"""
 <style>
   .stApp{{background:{BG};color:{FG};}}
@@ -30,7 +28,17 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ---- Helpers
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_voices()->List[Dict[str,str]]:
+    try:
+        r=requests.get(f"{API_BASE}/voices",timeout=20)
+        if r.status_code==200:
+            lst=r.json() or []
+            return [{"name":"Use API default","id":""}] + lst + [{"name":"Custom voice id…","id":"__custom__"}]
+    except Exception:
+        pass
+    return [{"name":"Use API default","id":""},{"name":"Custom voice id…","id":"__custom__"}]
+
 def parse_topics(s:str)->List[str]:
     out, seen=[],set()
     for c in s.replace(",","\n").split("\n"):
@@ -39,7 +47,6 @@ def parse_topics(s:str)->List[str]:
     return out
 
 def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Raw API call; surfaces real error text."""
     if not API_BASE.startswith("http"):
         raise RuntimeError("API_BASE not set. In Render → Environment, add API_BASE=https://thenoah.onrender.com")
     r = requests.post(f"{API_BASE}/generate", json=payload, timeout=600)
@@ -54,23 +61,9 @@ def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def generate_cached(payload_json: str) -> Dict[str, Any]:
-    """Cache around the API so a rerun/process blip doesn't lose the result."""
-    payload = json.loads(payload_json)
-    return call_api(payload)
-
-def fetch_voices()->List[Dict[str,str]]:
-    try:
-        r=requests.get(f"{API_BASE}/voices",timeout=20)
-        if r.status_code==200:
-            lst=r.json() or []
-            lst=[{"name":"Use API default","id":""}] + lst + [{"name":"Custom voice id…","id":"__custom__"}]
-            return lst
-    except Exception:
-        pass
-    return [{"name":"Use API default","id":""},{"name":"Custom voice id…","id":"__custom__"}]
+    return call_api(json.loads(payload_json))
 
 def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|None):
-    """Scrubbable, persistent audio player."""
     if not mp3_url:
         st.info("No audio returned.")
         return
@@ -88,11 +81,11 @@ def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|
       </script>
     """, unsafe_allow_html=True)
 
-# ---- Session state defaults
-st.session_state.setdefault("noah_result", None)     # {"data":..., "minutes":int, "strict":bool}
-st.session_state.setdefault("last_payload_json", "") # cached key
+# Session keys
+st.session_state.setdefault("noah_result", None)
+st.session_state.setdefault("last_payload_json", "")
 
-# ---- Header
+# Header
 c1,c2=st.columns([0.72,0.28])
 with c1:
     st.markdown(f"<h1 style='margin-bottom:.2rem'>{APP_TITLE}</h1>", unsafe_allow_html=True)
@@ -101,7 +94,7 @@ with c2:
     st.markdown(f"<div class='zem-card' style='text-align:right'><div class='smallcap'>API</div>"
                 f"<code style='font-size:12px'>{API_BASE or 'NOT SET'}</code></div>", unsafe_allow_html=True)
 
-# ---- Sidebar form (prevents reruns while typing)
+# Sidebar form (prevents reruns while typing)
 with st.sidebar:
     with st.form("controls", clear_on_submit=False):
         st.markdown("<div class='zem-label'>Language</div>", unsafe_allow_html=True)
@@ -134,7 +127,7 @@ with st.sidebar:
 
         submitted = st.form_submit_button("🚀 Generate Noah", use_container_width=True)
 
-# ---- On submit: build payload, CACHE the call, and store result in session_state
+# On submit: call cached API and save in session_state
 if submitted:
     queries = parse_topics(topics_raw)
     if not queries:
@@ -155,12 +148,11 @@ if submitted:
             payload["voice_id"] = voice_id
 
         payload_json = json.dumps(payload, sort_keys=True)
-
         with st.status("Generating your Noah… this can take 30–60 seconds", expanded=True) as s:
             try:
                 s.write("Contacting Noah API…")
                 t0=time.time()
-                data = generate_cached(payload_json)   # <-- cached
+                data = generate_cached(payload_json)
                 s.write(f"Received in {time.time()-t0:.1f}s")
                 s.update(label="Done ✓", state="complete")
 
@@ -174,7 +166,7 @@ if submitted:
                 s.update(label="Failed ✗", state="error")
                 st.error(str(e))
 
-# ---- Always render the last result from session_state (so it survives reruns)
+# Always render last result
 res = st.session_state.noah_result
 L,R = st.columns([0.5,0.5])
 if res and isinstance(res, dict):

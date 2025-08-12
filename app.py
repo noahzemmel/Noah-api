@@ -1,4 +1,4 @@
-# app.py — Streamlit UI for Noah that PERSISTS results and CACHES the API response
+# app.py — Streamlit UI for Noah (persistent + cached + download link)
 import os, time, json, requests, streamlit as st
 from typing import List, Dict, Any
 
@@ -25,6 +25,7 @@ st.markdown(f"""
   details{{border:1px solid {BORDER};border-radius:10px;overflow:hidden;}}
   details>summary{{cursor:pointer;background:{CARD};padding:8px 12px;}}
   details>div{{padding:10px 12px;}}
+  .dl a{{color:{FG};text-decoration:underline;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,7 +64,7 @@ def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
 def generate_cached(payload_json: str) -> Dict[str, Any]:
     return call_api(json.loads(payload_json))
 
-def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|None):
+def render_audio_and_link(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|None):
     if not mp3_url:
         st.info("No audio returned.")
         return
@@ -74,6 +75,7 @@ def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|
       <div class="zem-card">
         <audio id="noah-audio" controls preload="metadata" playsinline src="{mp3_url}"></audio>
         <div class="smallcap">Target: {target_min} min • Actual audio: {actual_sec/60:.1f} min • Playback rate: {rate:.2f}</div>
+        <div class="dl" style="margin-top:6px"><a href="{mp3_url}" target="_blank" rel="noopener">Download MP3</a></div>
       </div>
       <script>
         const a=document.getElementById('noah-audio');
@@ -81,7 +83,7 @@ def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|
       </script>
     """, unsafe_allow_html=True)
 
-# Session keys
+# Session
 st.session_state.setdefault("noah_result", None)
 st.session_state.setdefault("last_payload_json", "")
 
@@ -94,7 +96,7 @@ with c2:
     st.markdown(f"<div class='zem-card' style='text-align:right'><div class='smallcap'>API</div>"
                 f"<code style='font-size:12px'>{API_BASE or 'NOT SET'}</code></div>", unsafe_allow_html=True)
 
-# Sidebar form (prevents reruns while typing)
+# Sidebar form
 with st.sidebar:
     with st.form("controls", clear_on_submit=False):
         st.markdown("<div class='zem-label'>Language</div>", unsafe_allow_html=True)
@@ -127,9 +129,9 @@ with st.sidebar:
 
         submitted = st.form_submit_button("🚀 Generate Noah", use_container_width=True)
 
-# On submit: call cached API and save in session_state
+# Generate
 if submitted:
-    queries = parse_topics(topics_raw)
+    queries = [q for q in (topics_raw.replace(",", "\n").split("\n")) if q.strip()]
     if not queries:
         st.sidebar.error("Please add at least one topic.")
     else:
@@ -166,7 +168,7 @@ if submitted:
                 s.update(label="Failed ✗", state="error")
                 st.error(str(e))
 
-# Always render last result
+# Render last result
 res = st.session_state.noah_result
 L,R = st.columns([0.5,0.5])
 if res and isinstance(res, dict):
@@ -182,7 +184,7 @@ if res and isinstance(res, dict):
 
     with R:
         st.markdown("<h3>Your briefing</h3>", unsafe_allow_html=True)
-        render_audio(
+        render_audio_and_link(
             mp3_url=data.get("mp3_url",""),
             actual_sec=float(data.get("duration_seconds") or 0),
             target_min=int(minutes),

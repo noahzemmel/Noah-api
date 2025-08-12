@@ -1,12 +1,4 @@
 # noah_core.py — Core generation and exact-length audio for Noah
-# -----------------------------------------------------------------------------
-# Env needed on the API service:
-#   OPENAI_API_KEY, ELEVENLABS_API_KEY
-# Optional:
-#   ELEVENLABS_VOICE_ID (default voice id)
-#   NOAH_WORDS_PER_SECOND (override speaking rate)
-# -----------------------------------------------------------------------------
-
 import os, re, json, time, uuid, requests, feedparser
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime, timezone
@@ -20,8 +12,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 
-# tempo limits for ffmpeg atempo (mild to preserve quality)
-MIN_ATEMPO, MAX_ATEMPO = 0.85, 1.25
+# Fine-tune only; content length should do the heavy lifting
+MIN_ATEMPO, MAX_ATEMPO = 0.80, 1.25
 
 LANG_WPS = {
     "English": 2.6, "Spanish": 2.5, "French": 2.4, "German": 2.3, "Italian": 2.5,
@@ -75,96 +67,119 @@ def collect_sources(queries: List[str], recent_hours: int, cap: int) -> Dict[str
 def word_count(s: str) -> int:
     return len(re.findall(r"\b\w+\b", s))
 
-def compute_targets(minutes: int, wps: float, intro: str, outro: str) -> Tuple[int,int,int,int]:
+def compute_targets(minutes: int, wps: float, intro: str, outro: str, n_stories: int) -> Dict[str,int]:
     total_secs = max(1, minutes * 60)
-    target_words = int(total_secs * wps)
-    lo = max(120, int(target_words * 0.95))
-    hi = int(target_words * 1.05)
+    total_words = int(total_secs * wps)
     intro_w, outro_w = word_count(intro), word_count(outro)
-    body_hint = max(30, int((target_words - intro_w - outro_w) / 6))
-    return target_words, lo, hi, body_hint
+    body_words = max(60, total_words - intro_w - outro_w)
+    per_story = max(40, int(body_words / max(1, n_stories)))
+    return {
+        "total_words": total_words,
+        "min_words": int(total_words * 0.96),
+        "max_words": int(total_words * 1.04),
+        "per_story": per_story
+    }
 
 def openai_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
-def build_messages(language: str, tone: str, queries: List[str], sources: Dict[str, List[Dict[str,str]]],
-                   target: int, lo: int, hi: int, body_hint: int, intro: str, outro: str):
+def build_messages(language: str, tone: str, queries: List[str],
+                   sources: Dict[str,List[Dict[str,str]]],
+                   targets: Dict[str,int], intro: str, outro: str):
+    # Flatten sources list for outline sizing
+    flat = []
+    for q, items in sources.items():
+        for it in items:
+            flat.append((q, it.get("title",""), it.get("source",""), it.get("link","")))
+    n = max(6, len(flat))  # at least 6 stories
+    per_story = targets["per_story"]
+
     src_lines = []
     for q, items in sources.items():
         src_lines.append(f"Topic: {q}")
         for it in items:
             src_lines.append(f"- {it.get('title','')} ({it.get('source','')}) <{it.get('link','')}>")
-    src_text = "\n".join(src_lines[:120])
+    src_text = "\n".join(src_lines[:200])
 
     system = (
-        "You are Noah, a concise news editor.\n"
+        "You are Noah, a concise, factual news editor.\n"
         "Return JSON with keys 'bullets' and 'narration'.\n"
-        f"- Narration length (including intro/outro) MUST be between {lo} and {hi} words (target≈{target}).\n"
-        "- Focus on *fresh* items from provided sources; minimal background.\n"
-        "- Short, factual sentences. Start with intro exactly and end with outro exactly.\n"
+        f"- Narration MUST be between {targets['min_words']} and {targets['max_words']} words (target≈{targets['total_words']}).\n"
+        "- Use only the provided sources (no speculation). Keep sentences short and informative. No fluff.\n"
+        "- Start EXACTLY with the intro and end EXACTLY with the outro provided.\n"
     )
     user = (
         f"Language: {language}\nTone: {tone}\n\n"
         f"Intro: {intro}\nOutro: {outro}\n\n"
         "Queries:\n" + "\n".join([f"- {q}" for q in queries]) + "\n\n"
         "Sources to rely on:\n" + src_text + "\n\n"
-        f"Per-story hint: ~{body_hint} words.\n"
-        "Return STRICT JSON only, no code fences:\n{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
+        f"Make a brief outline of ~{n} stories, each ~{per_story} words, "
+        "then produce:\n"
+        "1) 'bullets': a compact markdown bullet list of headlines you cover;\n"
+        "2) 'narration': the full narration including the intro and outro.\n\n"
+        "Return STRICT JSON only (no code fences):\n"
+        "{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
     )
-    return [{"role":"system","content":system},{"role":"user","content":user}]
+    return [{"role":"system","content":system},{"role":"user","content":user}], n
+
+def refine_length(client: OpenAI, narration: str, language: str, tone: str,
+                  targets: Dict[str,int], direction: str) -> str:
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        messages=[
+            {"role":"system","content":"You precisely hit word targets without changing meaning."},
+            {"role":"user","content":
+                f"{direction} the narration to {targets['total_words']} words "
+                f"(must be {targets['min_words']}–{targets['max_words']}). "
+                f"Language={language}; tone={tone}. Keep ONLY facts from the supplied sources; no background. "
+                "Return ONLY the revised narration text.\n\n"
+                "Narration:\n"+narration}
+        ]
+    )
+    return (r.choices[0].message.content or "").strip()
 
 def generate_text(queries: List[str], language: str, tone: str,
                   sources: Dict[str,List[Dict[str,str]]], minutes: int) -> Tuple[str,str]:
     wps = wps_for(language)
     intro = INTRO.get(language, INTRO["English"])
     outro = OUTRO.get(language, OUTRO["English"])
-    target, lo, hi, body_hint = compute_targets(minutes, wps, intro, outro)
+    n_stories = max(6, sum(len(v) for v in sources.values()))
+    targets = compute_targets(minutes, wps, intro, outro, n_stories)
 
     client = openai_client()
-    for _ in range(4):
-        msgs = build_messages(language, tone, queries, sources, target, lo, hi, body_hint, intro, outro)
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=msgs,
-            response_format={"type": "json_object"},   # <— FORCE VALID JSON
-        )
-        content = (r.choices[0].message.content or "{}").strip()
-        data = json.loads(content)
+    # First pass
+    msgs, _ = build_messages(language, tone, queries, sources, targets, intro, outro)
+    r = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.25,
+        response_format={"type": "json_object"},
+        messages=msgs
+    )
+    js = json.loads((r.choices[0].message.content or "{}").strip())
+    bullets = (js.get("bullets") or "").strip()
+    narration = (js.get("narration") or "").strip()
 
-        bullets = (data.get("bullets") or "").strip()
-        narration = (data.get("narration") or "").strip()
-
+    # Correction passes (up to 5)
+    for _ in range(5):
         wc = word_count(narration)
-        if lo <= wc <= hi:
+        if targets["min_words"] <= wc <= targets["max_words"]:
             return bullets, narration
+        direction = "Expand" if wc < targets["min_words"] else "Tighten"
+        narration = refine_length(client, narration, language, tone, targets, direction)
 
-        goal = "Expand" if wc < lo else "Tighten"
-        r2 = client.chat.completions.create(
-            model="gpt-4o-mini", temperature=0.2,
-            messages=[
-                {"role":"system","content":"You precisely fit word targets."},
-                {"role":"user","content":
-                    f"{goal} to {target} words (must be {lo}–{hi}). Keep language={language}, tone={tone}. "
-                    "Use only the facts from the supplied sources. Return ONLY the revised narration.\n\n"
-                    "Current narration:\n"+narration}
-            ]
-        )
-        narration2 = (r2.choices[0].message.content or "").strip()
-        if lo <= word_count(narration2) <= hi:
-            return bullets, narration2
-        lo = int(lo * 0.98); hi = int(hi * 1.02)
-
-    toks = narration.split()
-    narration = " ".join(toks[:hi]) if len(toks) > hi else narration + "\n(…more headlines…)"
+    # Last resort: trim to max or note more headlines
+    wc = word_count(narration)
+    if wc > targets["max_words"]:
+        toks = narration.split()
+        narration = " ".join(toks[:targets["max_words"]])
+    elif wc < targets["min_words"]:
+        narration += "\n(Additional headlines omitted for time.)"
     return bullets, narration
 
 # -------------------- TTS --------------------
 
-def tts_eleven(text: str, voice_id: Optional[str], language: str) -> str:
-    """
-    Returns path to MP3. Auto-picks the first available voice if none provided.
-    """
+def tts_eleven(text: str, voice_id: Optional[str]) -> str:
     vid = voice_id or DEFAULT_VOICE_ID
     if not vid:
         try:
@@ -173,11 +188,11 @@ def tts_eleven(text: str, voice_id: Optional[str], language: str) -> str:
             if resp.status_code == 200:
                 voices = (resp.json() or {}).get("voices") or []
                 if voices:
-                    vid = voices[0].get("voice_id", "")
+                    vid = voices[0].get("voice_id","")
         except Exception:
             pass
     if not vid:
-        raise RuntimeError("ElevenLabs voice not set and no voices available on this account.")
+        raise RuntimeError("No ElevenLabs voice available for this account.")
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "accept":"audio/mpeg", "content-type":"application/json"}
@@ -185,7 +200,7 @@ def tts_eleven(text: str, voice_id: Optional[str], language: str) -> str:
                "voice_settings":{"stability":0.55,"similarity_boost":0.75,"style":0.25,"use_speaker_boost":True}}
     r = requests.post(url, headers=headers, json=payload, timeout=600)
     if r.status_code >= 400:
-        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text}")
+        raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text}")
 
     name = f"noah_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
     path = os.path.join(DATA_DIR, name)
@@ -224,7 +239,7 @@ def make_noah_audio(
     sources = collect_sources(queries, recent_hours, cap_per_query)
     bullets, narration = generate_text(queries, language, tone, sources, minutes_target)
 
-    mp3_path = tts_eleven(narration, voice_id, language)
+    mp3_path = tts_eleven(narration, voice_id)
     dur = duration_s(mp3_path)
     applied = 1.0
     if exact_minutes:

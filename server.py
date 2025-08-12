@@ -1,12 +1,10 @@
-# server.py — FastAPI for Noah (robust input + voices + exact-length)
-
+# server.py — FastAPI for Noah with inline audio + range support headers
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 import os, requests, logging, traceback
 from typing import List
-
 from noah_core import make_noah_audio, health_check
 
 app = FastAPI(title="Noah API", version="1.0.0")
@@ -106,4 +104,9 @@ def generate(payload: dict = Body(...)):
 def download(name: str):
     path = Path("/app/data") / name
     if not path.exists(): return JSONResponse({"error":"File not found."}, 404)
-    return FileResponse(str(path), media_type="audio/mpeg", filename=name)
+    # Use FileResponse but force headers that help browsers stream/seek
+    resp = FileResponse(str(path), media_type="audio/mpeg", filename=name)
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    resp.headers["Content-Disposition"] = f'inline; filename="{name}"'
+    resp.headers["Accept-Ranges"] = "bytes"
+    return resp

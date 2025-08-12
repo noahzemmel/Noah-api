@@ -1,3 +1,12 @@
+# noah_core.py — Core generation and exact-length audio for Noah
+# -----------------------------------------------------------------------------
+# Env needed on the API service:
+#   OPENAI_API_KEY, ELEVENLABS_API_KEY
+# Optional:
+#   ELEVENLABS_VOICE_ID (default voice id)
+#   NOAH_WORDS_PER_SECOND (override speaking rate)
+# -----------------------------------------------------------------------------
+
 import os, re, json, time, uuid, requests, feedparser
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime, timezone
@@ -11,10 +20,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 
-# Natural limits for atempo (server-side exact fit). Keep mild to preserve quality.
+# tempo limits for ffmpeg atempo (mild to preserve quality)
 MIN_ATEMPO, MAX_ATEMPO = 0.85, 1.25
 
-# Per-language speaking rates (words/sec). Tweak as needed.
 LANG_WPS = {
     "English": 2.6, "Spanish": 2.5, "French": 2.4, "German": 2.3, "Italian": 2.5,
     "Portuguese": 2.5, "Arabic": 2.3, "Hindi": 2.5, "Japanese": 2.2, "Korean": 2.3,
@@ -34,7 +42,8 @@ def now_iso() -> str:
 def wps_for(language: str) -> float:
     return float(os.getenv("NOAH_WORDS_PER_SECOND", LANG_WPS.get(language, DEFAULT_WPS)))
 
-# ---------- Sources (Google News) ----------
+# -------------------- Sources (Google News) --------------------
+
 def _google_news_rss(query: str, recent_hours: int) -> str:
     q = requests.utils.quote(query)
     when = f" when:{recent_hours}h" if recent_hours else ""
@@ -61,14 +70,14 @@ def fetch_sources(query: str, recent_hours: int, cap: int) -> List[Dict[str,str]
 def collect_sources(queries: List[str], recent_hours: int, cap: int) -> Dict[str,List[Dict[str,str]]]:
     return {q: fetch_sources(q, recent_hours, cap) for q in queries}
 
-# ---------- Script generation with *tight* word target ----------
+# -------------------- Script generation --------------------
+
 def word_count(s: str) -> int:
     return len(re.findall(r"\b\w+\b", s))
 
 def compute_targets(minutes: int, wps: float, intro: str, outro: str) -> Tuple[int,int,int,int]:
     total_secs = max(1, minutes * 60)
     target_words = int(total_secs * wps)
-    # Hit within ±5%. Also set hard min to avoid underfills.
     lo = max(120, int(target_words * 0.95))
     hi = int(target_words * 1.05)
     intro_w, outro_w = word_count(intro), word_count(outro)
@@ -89,22 +98,18 @@ def build_messages(language: str, tone: str, queries: List[str], sources: Dict[s
 
     system = (
         "You are Noah, a concise news editor.\n"
-        "Return *JSON* with keys 'bullets' and 'narration'.\n"
-        "Rules:\n"
-        f"- Narration (INCLUDING intro & outro) MUST be between {lo} and {hi} words (target≈{target}).\n"
-        "- Use fresh items from the provided sources; avoid background unless essential.\n"
-        "- Keep sentences short, factual, and topical.\n"
-        "- Start with the intro line and end with the outro line exactly as provided.\n"
+        "Return JSON with keys 'bullets' and 'narration'.\n"
+        f"- Narration length (including intro/outro) MUST be between {lo} and {hi} words (target≈{target}).\n"
+        "- Focus on *fresh* items from provided sources; only minimal context.\n"
+        "- Short, factual sentences. Start with intro exactly and end with outro exactly.\n"
     )
     user = (
-        f"Language: {language}\n"
-        f"Tone: {tone}\n\n"
-        f"Intro: {intro}\n"
-        f"Outro: {outro}\n\n"
+        f"Language: {language}\nTone: {tone}\n\n"
+        f"Intro: {intro}\nOutro: {outro}\n\n"
         "Queries:\n" + "\n".join([f"- {q}" for q in queries]) + "\n\n"
         "Sources to rely on:\n" + src_text + "\n\n"
-        f"Per-story hint: ~{body_hint} words (rebalance as needed).\n"
-        "Return JSON only:\n{\n  \"bullets\": \"markdown bullets\",\n  \"narration\": \"full narration including intro & outro\"\n}\n"
+        f"Per-story hint: ~{body_hint} words.\n"
+        "Return JSON only:\n{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
     )
     return [{"role":"system","content":system},{"role":"user","content":user}]
 
@@ -121,7 +126,6 @@ def generate_text(queries: List[str], language: str, tone: str,
         r = client.chat.completions.create(model="gpt-4o-mini", temperature=0.3, messages=msgs)
         content = (r.choices[0].message.content or "").strip()
 
-        # Extract JSON (robust)
         try:
             data = json.loads(content)
         except Exception:
@@ -135,12 +139,10 @@ def generate_text(queries: List[str], language: str, tone: str,
         if lo <= wc <= hi:
             return bullets, narration
 
-        # Ask model to expand/trim to target window
-        goal = f"Expand" if wc < lo else "Tighten"
+        goal = "Expand" if wc < lo else "Tighten"
         ask = (
-            f"{goal} to {target} words (must be between {lo} and {hi}). "
-            f"Keep language={language}, tone={tone}. Keep facts grounded in the supplied sources. "
-            "Return ONLY the revised narration text."
+            f"{goal} to {target} words (must be {lo}–{hi}). Keep language={language}, tone={tone}. "
+            "Use only the facts from the supplied sources. Return ONLY the revised narration."
         )
         r2 = client.chat.completions.create(
             model="gpt-4o-mini", temperature=0.2,
@@ -150,28 +152,41 @@ def generate_text(queries: List[str], language: str, tone: str,
         narration2 = (r2.choices[0].message.content or "").strip()
         if lo <= word_count(narration2) <= hi:
             return bullets, narration2
-
-        # Narrow window slightly next attempt
         lo = int(lo * 0.98); hi = int(hi * 1.02)
 
-    # Final fallback: trim/extend heuristically
+    # Fallback
     toks = narration.split()
-    if len(toks) < lo:
-        narration = narration + "\n\n" + " ".join(["(…more headlines…)" for _ in range((lo - len(toks)) // 3)])
-    else:
-        narration = " ".join(toks[:hi])
+    narration = " ".join(toks[:hi]) if len(toks) > hi else narration + "\n(…more headlines…)"
     return bullets, narration
 
-# ---------- TTS ----------
+# -------------------- TTS --------------------
+
 def tts_eleven(text: str, voice_id: Optional[str], language: str) -> str:
+    """
+    Returns path to MP3. Auto-picks the first available voice if none provided.
+    """
     vid = voice_id or DEFAULT_VOICE_ID
-    if not vid: raise RuntimeError("No ElevenLabs voice_id is set.")
+    if not vid:
+        try:
+            resp = requests.get("https://api.elevenlabs.io/v1/voices",
+                                headers={"xi-api-key": ELEVEN_API_KEY}, timeout=20)
+            if resp.status_code == 200:
+                voices = (resp.json() or {}).get("voices") or []
+                if voices:
+                    vid = voices[0].get("voice_id", "")
+        except Exception:
+            pass
+    if not vid:
+        raise RuntimeError("ElevenLabs voice not set and no voices available on this account.")
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
     headers = {"xi-api-key": ELEVEN_API_KEY, "accept":"audio/mpeg", "content-type":"application/json"}
-    payload = {"text": text, "model_id": "eleven_multilingual_v2",
+    payload = {"text": text, "model_id":"eleven_multilingual_v2",
                "voice_settings":{"stability":0.55,"similarity_boost":0.75,"style":0.25,"use_speaker_boost":True}}
     r = requests.post(url, headers=headers, json=payload, timeout=600)
-    if r.status_code >= 400: raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {r.text}")
+
     name = f"noah_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
     path = os.path.join(DATA_DIR, name)
     with open(path, "wb") as f: f.write(r.content)
@@ -183,8 +198,8 @@ def duration_s(path: str) -> float:
 def exactify_with_atempo(path: str, target_seconds: int) -> Tuple[str,float]:
     actual = duration_s(path)
     if actual <= 0 or target_seconds <= 0: return path, 1.0
-    desired_rate = actual / float(target_seconds)  # >1 means speed up, <1 slow down
-    rate = max(MIN_ATEMPO, min(MAX_ATEMPO, desired_rate))
+    desired = actual / float(target_seconds)  # >1 speed up, <1 slow down
+    rate = max(MIN_ATEMPO, min(MAX_ATEMPO, desired))
     if abs(rate - 1.0) < 0.02: return path, 1.0
     out = path.replace(".mp3","_exact.mp3")
     cmd = f'ffmpeg -y -i "{path}" -filter:a "atempo={rate:.6f}" -vn "{out}"'
@@ -192,7 +207,8 @@ def exactify_with_atempo(path: str, target_seconds: int) -> Tuple[str,float]:
     if code != 0 or not os.path.exists(out): return path, 1.0
     return out, rate
 
-# ---------- Orchestrator ----------
+# -------------------- Orchestrator --------------------
+
 def make_noah_audio(
     queries: List[str],
     language: str,

@@ -1,9 +1,9 @@
-# app.py — Streamlit UI for Noah that PERSISTS results in session_state
-import os, time, requests, streamlit as st
+# app.py — Streamlit UI for Noah that PERSISTS results and CACHES the API response
+import os, time, json, requests, streamlit as st
 from typing import List, Dict, Any
 
 # ---- Config
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
+API_BASE = os.getenv("API_BASE", "").rstrip("/")  # e.g., https://thenoah.onrender.com
 APP_TITLE = "Noah — Daily Smart Bulletins"
 
 ACCENT="#2563EB"; FG="#E8EDF7"; FG_MUTED="#C7D2FE"; BG="#0B1220"; CARD="#0F172A"; BORDER="#1F2A44"
@@ -12,7 +12,7 @@ st.set_page_config(page_title="Noah • Zem Labs", page_icon="🎧", layout="wid
 st.markdown(f"""
 <style>
   .stApp{{background:{BG};color:{FG};}}
-  .block-container{{padding-top:1.2rem;}}
+  .block-container{{padding-top:1.0rem;}}
   h1,h2,h3,h4{{color:{FG};}}
   .zem-card{{background:{CARD};border:1px solid {BORDER};border-radius:12px;padding:14px;}}
   .zem-label{{font-weight:700;font-size:.95rem;color:{FG};margin:10px 0 6px;display:block;}}
@@ -39,6 +39,7 @@ def parse_topics(s:str)->List[str]:
     return out
 
 def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Raw API call; surfaces real error text."""
     if not API_BASE.startswith("http"):
         raise RuntimeError("API_BASE not set. In Render → Environment, add API_BASE=https://thenoah.onrender.com")
     r = requests.post(f"{API_BASE}/generate", json=payload, timeout=600)
@@ -50,6 +51,12 @@ def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
     if r.status_code >= 400:
         raise RuntimeError(f"API {r.status_code}: {data.get('error', text)[:600]}")
     return data
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def generate_cached(payload_json: str) -> Dict[str, Any]:
+    """Cache around the API so a rerun/process blip doesn't lose the result."""
+    payload = json.loads(payload_json)
+    return call_api(payload)
 
 def fetch_voices()->List[Dict[str,str]]:
     try:
@@ -81,11 +88,9 @@ def render_audio(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|
       </script>
     """, unsafe_allow_html=True)
 
-# ---- Session state
-if "noah_result" not in st.session_state:
-    st.session_state.noah_result = None
-if "last_payload" not in st.session_state:
-    st.session_state.last_payload = None
+# ---- Session state defaults
+st.session_state.setdefault("noah_result", None)     # {"data":..., "minutes":int, "strict":bool}
+st.session_state.setdefault("last_payload_json", "") # cached key
 
 # ---- Header
 c1,c2=st.columns([0.72,0.28])
@@ -129,33 +134,42 @@ with st.sidebar:
 
         submitted = st.form_submit_button("🚀 Generate Noah", use_container_width=True)
 
-# ---- If submitted, call the API and SAVE the result in session_state
+# ---- On submit: build payload, CACHE the call, and store result in session_state
 if submitted:
     queries = parse_topics(topics_raw)
     if not queries:
         st.sidebar.error("Please add at least one topic.")
     else:
-        payload={"queries":queries,"language":language,"tone":tone,"recent_hours":int(lookback),
-                 "per_feed":6,"cap_per_query":int(cap),
-                 "min_minutes":int(minutes),"minutes_target":int(minutes),
-                 "exact_minutes":True}
+        payload = {
+            "queries": queries,
+            "language": language,
+            "tone": tone,
+            "recent_hours": int(lookback),
+            "per_feed": 6,
+            "cap_per_query": int(cap),
+            "min_minutes": int(minutes),
+            "minutes_target": int(minutes),
+            "exact_minutes": True,
+        }
         if voice_id and voice_id!="__custom__":
-            payload["voice_id"]=voice_id
+            payload["voice_id"] = voice_id
+
+        payload_json = json.dumps(payload, sort_keys=True)
 
         with st.status("Generating your Noah… this can take 30–60 seconds", expanded=True) as s:
             try:
                 s.write("Contacting Noah API…")
                 t0=time.time()
-                data=call_api(payload)
+                data = generate_cached(payload_json)   # <-- cached
                 s.write(f"Received in {time.time()-t0:.1f}s")
                 s.update(label="Done ✓", state="complete")
-                # PERSIST the result and payload
+
                 st.session_state.noah_result = {
                     "data": data,
                     "minutes": int(minutes),
                     "strict": bool(strict),
                 }
-                st.session_state.last_payload = payload
+                st.session_state.last_payload_json = payload_json
             except Exception as e:
                 s.update(label="Failed ✗", state="error")
                 st.error(str(e))

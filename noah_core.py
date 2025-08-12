@@ -100,7 +100,7 @@ def build_messages(language: str, tone: str, queries: List[str], sources: Dict[s
         "You are Noah, a concise news editor.\n"
         "Return JSON with keys 'bullets' and 'narration'.\n"
         f"- Narration length (including intro/outro) MUST be between {lo} and {hi} words (target≈{target}).\n"
-        "- Focus on *fresh* items from provided sources; only minimal context.\n"
+        "- Focus on *fresh* items from provided sources; minimal background.\n"
         "- Short, factual sentences. Start with intro exactly and end with outro exactly.\n"
     )
     user = (
@@ -109,7 +109,7 @@ def build_messages(language: str, tone: str, queries: List[str], sources: Dict[s
         "Queries:\n" + "\n".join([f"- {q}" for q in queries]) + "\n\n"
         "Sources to rely on:\n" + src_text + "\n\n"
         f"Per-story hint: ~{body_hint} words.\n"
-        "Return JSON only:\n{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
+        "Return STRICT JSON only, no code fences:\n{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
     )
     return [{"role":"system","content":system},{"role":"user","content":user}]
 
@@ -123,14 +123,14 @@ def generate_text(queries: List[str], language: str, tone: str,
     client = openai_client()
     for _ in range(4):
         msgs = build_messages(language, tone, queries, sources, target, lo, hi, body_hint, intro, outro)
-        r = client.chat.completions.create(model="gpt-4o-mini", temperature=0.3, messages=msgs)
-        content = (r.choices[0].message.content or "").strip()
-
-        try:
-            data = json.loads(content)
-        except Exception:
-            m = re.search(r"\{.*\}", content, re.S)
-            data = json.loads(m.group(0)) if m else {}
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=msgs,
+            response_format={"type": "json_object"},   # <— FORCE VALID JSON
+        )
+        content = (r.choices[0].message.content or "{}").strip()
+        data = json.loads(content)
 
         bullets = (data.get("bullets") or "").strip()
         narration = (data.get("narration") or "").strip()
@@ -140,21 +140,21 @@ def generate_text(queries: List[str], language: str, tone: str,
             return bullets, narration
 
         goal = "Expand" if wc < lo else "Tighten"
-        ask = (
-            f"{goal} to {target} words (must be {lo}–{hi}). Keep language={language}, tone={tone}. "
-            "Use only the facts from the supplied sources. Return ONLY the revised narration."
-        )
         r2 = client.chat.completions.create(
             model="gpt-4o-mini", temperature=0.2,
-            messages=[{"role":"system","content":"You precisely fit word targets."},
-                      {"role":"user","content": ask + "\n\nCurrent narration:\n" + narration}]
+            messages=[
+                {"role":"system","content":"You precisely fit word targets."},
+                {"role":"user","content":
+                    f"{goal} to {target} words (must be {lo}–{hi}). Keep language={language}, tone={tone}. "
+                    "Use only the facts from the supplied sources. Return ONLY the revised narration.\n\n"
+                    "Current narration:\n"+narration}
+            ]
         )
         narration2 = (r2.choices[0].message.content or "").strip()
         if lo <= word_count(narration2) <= hi:
             return bullets, narration2
         lo = int(lo * 0.98); hi = int(hi * 1.02)
 
-    # Fallback
     toks = narration.split()
     narration = " ".join(toks[:hi]) if len(toks) > hi else narration + "\n(…more headlines…)"
     return bullets, narration

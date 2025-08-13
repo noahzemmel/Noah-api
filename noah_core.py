@@ -1,4 +1,4 @@
-# noah_core.py — Exact-length generation with per-voice WPS calibration
+# noah_core.py — Exact-length generation with robust OpenAI parsing + per-voice WPS calibration
 import os, re, json, time, uuid, requests, feedparser
 from typing import Dict, List, Any, Tuple, Optional
 from datetime import datetime, timezone
@@ -44,6 +44,54 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 def openai_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
+
+# Robust readers for OpenAI outputs (handles string, list-of-parts, and parsed)
+def _message_text(msg_obj) -> str:
+    """
+    Returns best-effort plain text from an OpenAI ChatCompletionMessage.
+    Works if content is str, list[dict{type,text}], or something odd.
+    """
+    if msg_obj is None:
+        return ""
+    # 'parsed' appears on some SDKs when response_format=json_object
+    parsed = getattr(msg_obj, "parsed", None)
+    if isinstance(parsed, dict):
+        try:
+            return json.dumps(parsed)
+        except Exception:
+            pass
+
+    content = getattr(msg_obj, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        buf = []
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                buf.append(part.get("text", ""))
+            else:
+                buf.append(str(part))
+        return "".join(buf)
+    if isinstance(content, dict):
+        try:
+            return json.dumps(content)
+        except Exception:
+            return str(content)
+    return str(content or "")
+
+def _message_json(msg_obj) -> Dict[str, Any]:
+    """
+    Best-effort JSON extraction from an OpenAI message.
+    Tries 'parsed' first, then parses text.
+    """
+    parsed = getattr(msg_obj, "parsed", None)
+    if isinstance(parsed, dict):
+        return parsed
+    text = _message_text(msg_obj)
+    try:
+        return json.loads(text.strip())
+    except Exception:
+        return {}
 
 # ---------------- Source collection (Google News) ----------------
 def _google_news_rss(query: str, recent_hours: int) -> str:
@@ -140,7 +188,6 @@ def _save_wps_cache(cache: Dict[str, Any]) -> None:
         pass
 
 def _calibration_text(language: str, words: int = 150) -> str:
-    # Short neutral passage that speaks naturally
     base = "This sample measures typical narration speed for news style delivery."
     sent_words = word_count(base)
     reps = max(1, int(words / sent_words))
@@ -160,7 +207,6 @@ def calibrate_wps(voice_id: Optional[str], language: str) -> float:
     if rec and (now - rec.get("ts", 0)) < (WPS_CACHE_TTL_DAYS * 86400):
         return float(rec.get("wps", DEFAULT_WPS))
 
-    # Do calibration
     try:
         text = _calibration_text(language, 150)  # ~150 words
         tmp_path = tts_to_file(text, vid)
@@ -171,7 +217,6 @@ def calibrate_wps(voice_id: Optional[str], language: str) -> float:
         _save_wps_cache(cache)
         return float(wps)
     except Exception:
-        # fallback
         return float(LANG_WPS.get(language, DEFAULT_WPS))
 
 # ---------------- Target calculation ----------------
@@ -181,10 +226,9 @@ def compute_targets(minutes: int, wps: float, intro: str, outro: str, n_stories:
     intro_w, outro_w = word_count(intro), word_count(outro)
     body_words = max(60, total_words - intro_w - outro_w)
     per_story = max(40, int(body_words / max(6, n_stories)))
-    # Tight band: ±1% around the total target
     return {
         "total": total_words,
-        "min": int(total_words * 0.99),
+        "min": int(total_words * 0.99),   # tight ±1%
         "max": int(total_words * 1.01),
         "per_story": per_story
     }
@@ -207,7 +251,7 @@ def build_messages(language: str, tone: str, queries: List[str],
         "You are Noah, a concise, factual news editor.\n"
         "Return JSON with keys 'bullets' and 'narration'.\n"
         f"- The final 'narration' MUST be between {targets['min']} and {targets['max']} words (target≈{targets['total']}).\n"
-        "- Use only the provided sources. No filler, no background unless essential to understand the update.\n"
+        "- Use only the provided sources. No filler; focus on very recent updates.\n"
         "- Sentences short and crisp. Start EXACTLY with the intro and end EXACTLY with the outro.\n"
     )
     user = (
@@ -238,7 +282,9 @@ def refine_length(client: OpenAI, narration: str, language: str, tone: str,
                 "Narration:\n"+narration}
         ]
     )
-    return (r.choices[0].message.content or "").strip()
+    # robust read
+    txt = _message_text(r.choices[0].message)
+    return (txt or "").strip()
 
 def generate_text(queries: List[str], language: str, tone: str,
                   sources: Dict[str,List[Dict[str,str]]], minutes: int,
@@ -265,9 +311,9 @@ def generate_text(queries: List[str], language: str, tone: str,
             response_format={"type": "json_object"},
             messages=msgs
         )
-        js = json.loads((r.choices[0].message.content or "{}").strip())
-        bullets = (js.get("bullets") or "").strip()
-        narration = (js.get("narration") or "").strip()
+        js = _message_json(r.choices[0].message)
+        bullets = (js.get("bullets") or "").strip() if isinstance(js.get("bullets"), str) else str(js.get("bullets", ""))
+        narration = (js.get("narration") or "").strip() if isinstance(js.get("narration"), str) else str(js.get("narration", ""))
 
         # Up to 8 correction passes to enter the ±1% band
         for _ in range(8):
@@ -278,8 +324,7 @@ def generate_text(queries: List[str], language: str, tone: str,
             narration = refine_length(client, narration, language, tone, targets, direction)
             corrections_total += 1
 
-        # Escalate: tell the model to add/remove distinct headlines to meet length precisely
-        # Slightly widen band for the next attempt
+        # Escalate: slightly widen band for next attempt
         targets["min"] = int(targets["total"] * 0.985)
         targets["max"] = int(targets["total"] * 1.015)
 
@@ -338,7 +383,7 @@ def make_noah_audio(
         "minutes_target": minutes_target,
         "playback_rate_applied": applied,
         "generated_at": now_iso(),
-        # Debug / telemetry (helpful for QA)
+        # Diagnostics for QA
         "calibrated_wps": wps,
         "narration_word_count": wc,
         "correction_passes": corr,

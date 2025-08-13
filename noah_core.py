@@ -1,6 +1,6 @@
-# noah_core.py — Exact-length generation with robust OpenAI parsing + per-voice WPS calibration
+# noah_core.py — exact-length generation with progress hooks, retries, and fast calibration
 import os, re, json, time, uuid, requests, feedparser
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Callable
 from datetime import datetime, timezone
 from pydub import AudioSegment
 from openai import OpenAI
@@ -15,10 +15,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 
-# Final atempo bounds (stay mild for quality)
-MIN_ATEMPO, MAX_ATEMPO = 0.80, 1.25
+# Final atempo bounds (keep mild for quality)
+MIN_ATEMPO, MAX_ATEMPO = 0.85, 1.20
 
-# Safe fallback WPS if calibration not available
+# Fallback WPS if calibration not available
 LANG_WPS = {
     "English": 2.6, "Spanish": 2.5, "French": 2.4, "German": 2.3, "Italian": 2.5,
     "Portuguese": 2.5, "Arabic": 2.3, "Hindi": 2.5, "Japanese": 2.2, "Korean": 2.3,
@@ -45,53 +45,18 @@ def clamp(x: float, lo: float, hi: float) -> float:
 def openai_client() -> OpenAI:
     return OpenAI(api_key=OPENAI_API_KEY)
 
-# Robust readers for OpenAI outputs (handles string, list-of-parts, and parsed)
-def _message_text(msg_obj) -> str:
-    """
-    Returns best-effort plain text from an OpenAI ChatCompletionMessage.
-    Works if content is str, list[dict{type,text}], or something odd.
-    """
-    if msg_obj is None:
-        return ""
-    # 'parsed' appears on some SDKs when response_format=json_object
-    parsed = getattr(msg_obj, "parsed", None)
-    if isinstance(parsed, dict):
+def _with_retries(fn: Callable[[], requests.Response], tries=3, base=1.0, factor=1.6):
+    last = None
+    for i in range(tries):
         try:
-            return json.dumps(parsed)
-        except Exception:
-            pass
-
-    content = getattr(msg_obj, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        buf = []
-        for part in content:
-            if isinstance(part, dict) and "text" in part:
-                buf.append(part.get("text", ""))
-            else:
-                buf.append(str(part))
-        return "".join(buf)
-    if isinstance(content, dict):
-        try:
-            return json.dumps(content)
-        except Exception:
-            return str(content)
-    return str(content or "")
-
-def _message_json(msg_obj) -> Dict[str, Any]:
-    """
-    Best-effort JSON extraction from an OpenAI message.
-    Tries 'parsed' first, then parses text.
-    """
-    parsed = getattr(msg_obj, "parsed", None)
-    if isinstance(parsed, dict):
-        return parsed
-    text = _message_text(msg_obj)
-    try:
-        return json.loads(text.strip())
-    except Exception:
-        return {}
+            r = fn()
+            if r.status_code in (502, 503, 504):
+                raise requests.exceptions.RequestException(f"Upstream {r.status_code}")
+            return r
+        except Exception as e:
+            last = e
+            time.sleep(base * (factor ** i))
+    raise last
 
 # ---------------- Source collection (Google News) ----------------
 def _google_news_rss(query: str, recent_hours: int) -> str:
@@ -129,7 +94,7 @@ def _tts_call(text: str, voice_id: str) -> bytes:
         "model_id": "eleven_multilingual_v2",
         "voice_settings": {"stability":0.55,"similarity_boost":0.75,"style":0.25,"use_speaker_boost":True}
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=600)
+    r = _with_retries(lambda: requests.post(url, headers=headers, json=payload, timeout=180))
     if r.status_code >= 400:
         raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:300]}")
     return r.content
@@ -138,14 +103,12 @@ def _resolve_voice(voice_id: Optional[str]) -> str:
     vid = voice_id or DEFAULT_VOICE_ID
     if vid:
         return vid
-    # Auto-pick first voice on account if default not set
     try:
-        r = requests.get("https://api.elevenlabs.io/v1/voices",
-                         headers={"xi-api-key": ELEVEN_API_KEY}, timeout=20)
-        if r.status_code == 200:
-            voices = (r.json() or {}).get("voices") or []
-            if voices:
-                return voices[0].get("voice_id","")
+        r = _with_retries(lambda: requests.get("https://api.elevenlabs.io/v1/voices",
+                                               headers={"xi-api-key": ELEVEN_API_KEY}, timeout=20))
+        voices = (r.json() or {}).get("voices") or []
+        if voices:
+            return voices[0].get("voice_id","")
     except Exception:
         pass
     raise RuntimeError("No ElevenLabs voice available for this account.")
@@ -187,36 +150,34 @@ def _save_wps_cache(cache: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-def _calibration_text(language: str, words: int = 150) -> str:
+def _calibration_text(language: str, words: int = 100) -> str:
     base = "This sample measures typical narration speed for news style delivery."
     sent_words = word_count(base)
     reps = max(1, int(words / sent_words))
-    para = " ".join([base] * reps)
-    return para
+    return " ".join([base] * reps)
 
-def calibrate_wps(voice_id: Optional[str], language: str) -> float:
-    """
-    Returns WPS for (voice_id, language). Cached for 30 days.
-    Falls back to LANG_WPS/DEFAULT_WPS if calibration fails.
-    """
+def calibrate_wps(voice_id: Optional[str], language: str, progress=None) -> float:
     vid = _resolve_voice(voice_id)
     key = f"{language}::{vid}"
     cache = _load_wps_cache()
     rec = cache.get(key)
     now = time.time()
     if rec and (now - rec.get("ts", 0)) < (WPS_CACHE_TTL_DAYS * 86400):
+        if progress: progress("calibration_cache_hit")
         return float(rec.get("wps", DEFAULT_WPS))
 
+    if progress: progress("calibrating_voice")
     try:
-        text = _calibration_text(language, 150)  # ~150 words
+        text = _calibration_text(language, 100)  # faster
         tmp_path = tts_to_file(text, vid)
         dur = audio_duration(tmp_path)  # seconds
         wc = word_count(text)
-        wps = clamp(wc / max(dur, 1.0), 1.4, 4.0)  # bound to sane range
+        wps = clamp(wc / max(dur, 1.0), 1.6, 3.6)  # bound
         cache[key] = {"wps": wps, "ts": now}
         _save_wps_cache(cache)
         return float(wps)
     except Exception:
+        if progress: progress("calibration_failed")
         return float(LANG_WPS.get(language, DEFAULT_WPS))
 
 # ---------------- Target calculation ----------------
@@ -228,10 +189,72 @@ def compute_targets(minutes: int, wps: float, intro: str, outro: str, n_stories:
     per_story = max(40, int(body_words / max(6, n_stories)))
     return {
         "total": total_words,
-        "min": int(total_words * 0.99),   # tight ±1%
+        "min": int(total_words * 0.99),
         "max": int(total_words * 1.01),
         "per_story": per_story
     }
+
+# ---------------- OpenAI helpers ----------------
+def _message_text(msg_obj) -> str:
+    if msg_obj is None: return ""
+    parsed = getattr(msg_obj, "parsed", None)
+    if isinstance(parsed, dict):
+        try: return json.dumps(parsed)
+        except Exception: pass
+    content = getattr(msg_obj, "content", None)
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        buf = []
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                buf.append(part.get("text", ""))
+            else:
+                buf.append(str(part))
+        return "".join(buf)
+    if isinstance(content, dict):
+        try: return json.dumps(content)
+        except Exception: return str(content)
+    return str(content or "")
+
+def _message_json(msg_obj) -> Dict[str, Any]:
+    parsed = getattr(msg_obj, "parsed", None)
+    if isinstance(parsed, dict): return parsed
+    text = _message_text(msg_obj)
+    try: return json.loads(text.strip())
+    except Exception: return {}
+
+def _chat_json(client: OpenAI, messages: list, temp=0.25) -> Dict[str, Any]:
+    tries = 3
+    last = {}
+    for i in range(tries):
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=temp,
+            response_format={"type": "json_object"},
+            messages=messages,
+            timeout=60
+        )
+        js = _message_json(r.choices[0].message)
+        if js: return js
+        time.sleep(1.2 * (i+1))
+        last = js
+    return last
+
+def _chat_text(client: OpenAI, messages: list, temp=0.2) -> str:
+    tries = 3
+    last = ""
+    for i in range(tries):
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=temp,
+            messages=messages,
+            timeout=60
+        )
+        txt = (_message_text(r.choices[0].message) or "").strip()
+        if txt: return txt
+        time.sleep(1.2 * (i+1))
+        last = txt
+    return last
 
 # ---------------- Prompting ----------------
 def build_messages(language: str, tone: str, queries: List[str],
@@ -251,7 +274,7 @@ def build_messages(language: str, tone: str, queries: List[str],
         "You are Noah, a concise, factual news editor.\n"
         "Return JSON with keys 'bullets' and 'narration'.\n"
         f"- The final 'narration' MUST be between {targets['min']} and {targets['max']} words (target≈{targets['total']}).\n"
-        "- Use only the provided sources. No filler; focus on very recent updates.\n"
+        "- Use only the provided sources. No filler; keep it topical and recent.\n"
         "- Sentences short and crisp. Start EXACTLY with the intro and end EXACTLY with the outro.\n"
     )
     user = (
@@ -269,29 +292,21 @@ def build_messages(language: str, tone: str, queries: List[str],
 
 def refine_length(client: OpenAI, narration: str, language: str, tone: str,
                   targets: Dict[str,int], direction: str) -> str:
-    r = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role":"system","content":"You precisely fit strict word targets without changing meaning."},
-            {"role":"user","content":
-                f"{direction} the narration to {targets['total']} words "
-                f"(must be {targets['min']}–{targets['max']}). "
-                f"Language={language}; tone={tone}. Keep ONLY fresh facts from the supplied sources; no background. "
-                "Return ONLY the revised narration text.\n\n"
-                "Narration:\n"+narration}
-        ]
-    )
-    # robust read
-    txt = _message_text(r.choices[0].message)
-    return (txt or "").strip()
+    msgs = [
+        {"role":"system","content":"You precisely fit strict word targets without changing meaning."},
+        {"role":"user","content":
+            f"{direction} the narration to {targets['total']} words "
+            f"(must be {targets['min']}–{targets['max']}). "
+            f"Language={language}; tone={tone}. Keep ONLY fresh facts from the supplied sources; no background. "
+            "Return ONLY the revised narration text.\n\n"
+            "Narration:\n"+narration}
+    ]
+    return _chat_text(openai_client(), msgs, temp=0.2)
 
+# ---------------- Generation ----------------
 def generate_text(queries: List[str], language: str, tone: str,
                   sources: Dict[str,List[Dict[str,str]]], minutes: int,
-                  wps: float) -> Tuple[str,str,int,int,int]:
-    """
-    Returns bullets, narration, actual_wc, corrections, attempts_used
-    """
+                  wps: float, progress=None) -> Tuple[str,str,int,int,int]:
     intro = INTRO.get(language, INTRO["English"])
     outro = OUTRO.get(language, OUTRO["English"])
     n_stories = max(6, sum(len(v) for v in sources.values()))
@@ -304,27 +319,26 @@ def generate_text(queries: List[str], language: str, tone: str,
 
     while attempts < 3:
         attempts += 1
+        if progress: progress(f"draft_attempt_{attempts}")
         msgs = build_messages(language, tone, queries, sources, targets, intro, outro)
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.25,
-            response_format={"type": "json_object"},
-            messages=msgs
-        )
-        js = _message_json(r.choices[0].message)
-        bullets = (js.get("bullets") or "").strip() if isinstance(js.get("bullets"), str) else str(js.get("bullets", ""))
-        narration = (js.get("narration") or "").strip() if isinstance(js.get("narration"), str) else str(js.get("narration", ""))
+        js = _chat_json(client, msgs, temp=0.25)
+        bullets = (js.get("bullets") or "")
+        if not isinstance(bullets, str): bullets = str(bullets)
+        narration = (js.get("narration") or "")
+        if not isinstance(narration, str): narration = str(narration)
+        bullets, narration = bullets.strip(), narration.strip()
 
-        # Up to 8 correction passes to enter the ±1% band
-        for _ in range(8):
+        # Up to 6 correction passes to enter ±1% band
+        for _ in range(6):
             wc = word_count(narration)
             if targets["min"] <= wc <= targets["max"]:
                 return bullets, narration, wc, corrections_total, attempts
             direction = "Expand" if wc < targets["min"] else "Tighten"
+            if progress: progress(f"correct_{direction.lower()}_{wc}")
             narration = refine_length(client, narration, language, tone, targets, direction)
             corrections_total += 1
 
-        # Escalate: slightly widen band for next attempt
+        # Widen slightly for next attempt
         targets["min"] = int(targets["total"] * 0.985)
         targets["max"] = int(targets["total"] * 1.015)
 
@@ -348,31 +362,37 @@ def make_noah_audio(
     minutes_target: int,
     exact_minutes: bool = True,
     voice_id: Optional[str] = None,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
 
     # 1) sources
+    if progress: progress("collecting_sources")
     sources = collect_sources(queries, recent_hours, cap_per_query)
 
     # 2) per-voice calibrated WPS (cached)
-    wps = calibrate_wps(voice_id, language)
+    wps = calibrate_wps(voice_id, language, progress=progress)
 
     # 3) generate text to target words
     bullets, narration, wc, corr, attempts = generate_text(
-        queries, language, tone, sources, minutes_target, wps
+        queries, language, tone, sources, minutes_target, wps, progress=progress
     )
 
     # 4) TTS
+    if progress: progress("tts_start")
     mp3_path = tts_to_file(narration, voice_id)
     dur = audio_duration(mp3_path)
     applied = 1.0
 
     # 5) Exactify
     if exact_minutes:
+        if progress: progress("exactify_audio")
         target = max(1, minutes_target * 60)
         new_path, applied = exactify_with_atempo(mp3_path, target)
         if new_path != mp3_path:
             mp3_path = new_path
             dur = audio_duration(mp3_path)
+
+    if progress: progress("done")
 
     return {
         "bullet_points": bullets,
@@ -383,7 +403,7 @@ def make_noah_audio(
         "minutes_target": minutes_target,
         "playback_rate_applied": applied,
         "generated_at": now_iso(),
-        # Diagnostics for QA
+        # Diagnostics
         "calibrated_wps": wps,
         "narration_word_count": wc,
         "correction_passes": corr,

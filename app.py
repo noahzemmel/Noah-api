@@ -1,206 +1,152 @@
-# app.py — Streamlit UI for Noah (persistent + cached + download link)
+# app.py — Streamlit UI (async API flow + polling + persist result)
 import os, time, json, requests, streamlit as st
-from typing import List, Dict, Any
 
-API_BASE = os.getenv("API_BASE", "").rstrip("/")  # e.g., https://thenoah.onrender.com
-APP_TITLE = "Noah — Daily Smart Bulletins"
+API_BASE = os.getenv("API_BASE", "https://thenoah.onrender.com")
 
-ACCENT="#2563EB"; FG="#E8EDF7"; FG_MUTED="#C7D2FE"; BG="#0B1220"; CARD="#0F172A"; BORDER="#1F2A44"
-st.set_page_config(page_title="Noah • Zem Labs", page_icon="🎧", layout="wide")
-st.markdown(f"""
+st.set_page_config(
+    page_title="Noah — Daily Smart Bulletins",
+    page_icon="🗞️",
+    layout="wide",
+)
+
+# --------- Styles (no red; high contrast) ----------
+st.markdown("""
 <style>
-  .stApp{{background:{BG};color:{FG};}}
-  .block-container{{padding-top:1.0rem;}}
-  h1,h2,h3,h4{{color:{FG};}}
-  .zem-card{{background:{CARD};border:1px solid {BORDER};border-radius:12px;padding:14px;}}
-  .zem-label{{font-weight:700;font-size:.95rem;color:{FG};margin:10px 0 6px;display:block;}}
-  textarea,.stTextArea textarea,input,select{{background:{CARD}!important;color:{FG}!important;
-    border:1px solid {BORDER}!important;border-radius:10px!important;}}
-  .stSelectbox [data-baseweb="select"]>div{{background:{CARD}!important;color:{FG}!important;
-    border:1px solid {BORDER}!important;border-radius:10px!important;}}
-  .stSlider>div>div>div>div{{background:{ACCENT};}}
-  .stButton>button{{background:{ACCENT};color:white;border:0;border-radius:10px;padding:10px 14px;font-weight:700;}}
-  ::placeholder{{color:{FG_MUTED};opacity:.95;}}
-  audio{{width:100%;border-radius:10px;height:40px;}}
-  details{{border:1px solid {BORDER};border-radius:10px;overflow:hidden;}}
-  details>summary{{cursor:pointer;background:{CARD};padding:8px 12px;}}
-  details>div{{padding:10px 12px;}}
-  .dl a{{color:{FG};text-decoration:underline;}}
+.small-muted {color:#9AA6B2;font-size:0.85rem;}
+.card {background:#0F172A;border-radius:14px;padding:18px;border:1px solid #1F2A44;}
+h1,h2,h3 {color:#E8EDF7}
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_voices()->List[Dict[str,str]]:
+# --------- Sidebar (inputs) ----------
+with st.sidebar:
+    st.header("Language")
+    lang = st.selectbox("Language", ["English"], index=0)
+
+    st.header("Voice")
+    # optional: load voices from API for dropdown
+    voice_opts = ["Use API default"]
     try:
-        r=requests.get(f"{API_BASE}/voices",timeout=20)
-        if r.status_code==200:
-            lst=r.json() or []
-            return [{"name":"Use API default","id":""}] + lst + [{"name":"Custom voice id…","id":"__custom__"}]
+        r = requests.get(f"{API_BASE}/voices", timeout=10)
+        if r.ok:
+            for v in r.json():
+                voice_opts.append(f"{v['name']} — {v['id']}")
     except Exception:
         pass
-    return [{"name":"Use API default","id":""},{"name":"Custom voice id…","id":"__custom__"}]
+    sel_voice = st.selectbox("Voice", voice_opts, index=0)
+    voice_id = sel_voice.split("—")[-1].strip() if "—" in sel_voice else ""
 
-def parse_topics(s:str)->List[str]:
-    out, seen=[],set()
-    for c in s.replace(",","\n").split("\n"):
-        c=c.strip(); k=c.lower()
-        if c and k not in seen: out.append(c); seen.add(k)
-    return out
+    st.header("Topics / queries (one per line)")
+    topics = st.text_area("Topics", height=140, label_visibility="collapsed", placeholder="world news\nAI research")
 
-def call_api(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not API_BASE.startswith("http"):
-        raise RuntimeError("API_BASE not set. In Render → Environment, add API_BASE=https://thenoah.onrender.com")
-    r = requests.post(f"{API_BASE}/generate", json=payload, timeout=600)
-    text = r.text
-    try:
-        data = r.json()
-    except Exception:
-        data = {"error": text}
-    if r.status_code >= 400:
-        raise RuntimeError(f"API {r.status_code}: {data.get('error', text)[:600]}")
-    return data
+    st.header("Exact length (minutes)")
+    minutes = st.slider("Exact minutes", 2, 30, 8, 1)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def generate_cached(payload_json: str) -> Dict[str, Any]:
-    return call_api(json.loads(payload_json))
+    st.header("Tone")
+    tone = st.selectbox("Tone", [
+        "confident and crisp","calm and neutral","warm and friendly","fast and energetic"
+    ], index=0)
 
-def render_audio_and_link(mp3_url:str, actual_sec:float, target_min:int, rate_hint:float|None):
-    if not mp3_url:
-        st.info("No audio returned.")
-        return
-    if not mp3_url.startswith("http"):
-        mp3_url=f"{API_BASE}{mp3_url}"
-    rate = rate_hint or 1.0
-    st.markdown(f"""
-      <div class="zem-card">
-        <audio id="noah-audio" controls preload="metadata" playsinline src="{mp3_url}"></audio>
-        <div class="smallcap">Target: {target_min} min • Actual audio: {actual_sec/60:.1f} min • Playback rate: {rate:.2f}</div>
-        <div class="dl" style="margin-top:6px"><a href="{mp3_url}" target="_blank" rel="noopener">Download MP3</a></div>
-      </div>
-      <script>
-        const a=document.getElementById('noah-audio');
-        if(a){{ a.addEventListener('loadedmetadata', ()=>{{ try{{ a.playbackRate={rate:.4f}; }}catch(e){{}} }}); }}
-      </script>
-    """, unsafe_allow_html=True)
+    st.header("How far back to look (hours)")
+    lookback = st.slider("Lookback", 6, 72, 24, 1)
 
-# Session
-st.session_state.setdefault("noah_result", None)
-st.session_state.setdefault("last_payload_json", "")
+    st.header("Maximum stories per topic")
+    cap = st.slider("Cap per topic", 2, 8, 6, 1)
 
-# Header
-c1,c2=st.columns([0.72,0.28])
-with c1:
-    st.markdown(f"<h1 style='margin-bottom:.2rem'>{APP_TITLE}</h1>", unsafe_allow_html=True)
-    st.caption("Generated news & insights in **your language**, **your voice**, **your time**.")
-with c2:
-    st.markdown(f"<div class='zem-card' style='text-align:right'><div class='smallcap'>API</div>"
-                f"<code style='font-size:12px'>{API_BASE or 'NOT SET'}</code></div>", unsafe_allow_html=True)
+    strict = st.toggle("Strict timing (playback adjusted to exact length)", value=True,
+                       help="Apply a tiny atempo nudge only if needed to hit the exact minute.")
 
-# Sidebar form
-with st.sidebar:
-    with st.form("controls", clear_on_submit=False):
-        st.markdown("<div class='zem-label'>Language</div>", unsafe_allow_html=True)
-        language=st.selectbox("Language",["English","Spanish","French","German","Italian","Portuguese",
-                            "Arabic","Hindi","Japanese","Korean","Chinese (Simplified)"],index=0,key="lang")
+    go = st.button("🚀 Generate Noah", use_container_width=True)
 
-        st.markdown("<div class='zem-label'>Voice</div>", unsafe_allow_html=True)
-        voice_options=fetch_voices(); voice_names=[v["name"] for v in voice_options]
-        voice_choice=st.selectbox("Voice", voice_names, index=0, key="voice")
-        voice_id=next((v["id"] for v in voice_options if v["name"]==voice_choice), "")
-        if voice_id=="__custom__":
-            voice_id=st.text_input("Paste custom ElevenLabs voice_id", key="custom_id")
+st.title("Noah — Daily Smart Bulletins")
+st.caption("Generated news & insights in your language, your voice, your time.")
 
-        st.markdown("<div class='zem-label'>Topics / queries (one per line)</div>", unsafe_allow_html=True)
-        topics_raw=st.text_area("Topics", height=140, value="world news\nAI research", key="topics")
+# --------- State for persistence ----------
+if "last" not in st.session_state:
+    st.session_state.last = None
 
-        st.markdown("<div class='zem-label'>Exact length (minutes)</div>", unsafe_allow_html=True)
-        minutes=st.slider("Exact minutes",2,30,8,key="min")
+def call_with_retry(method, url, **kw):
+    # small retry helper for transient 502/503
+    for i in range(4):
+        try:
+            r = requests.request(method, url, timeout=30, **kw)
+            if r.status_code in (502, 503, 504):
+                time.sleep(1.5 * (i+1))
+                continue
+            return r
+        except requests.exceptions.RequestException:
+            time.sleep(1.5 * (i+1))
+    raise RuntimeError(f"Failed to reach {url}")
 
-        st.markdown("<div class='zem-label'>Tone</div>", unsafe_allow_html=True)
-        tone=st.selectbox("Tone",["neutral and calm","confident and crisp","warm and friendly","energetic and upbeat"],index=1,key="tone")
-
-        st.markdown("<div class='zem-label'>How far back to look (hours)</div>", unsafe_allow_html=True)
-        lookback=st.select_slider("Lookback", options=[6,12,24,36,48,72], value=24, key="lb")
-
-        st.markdown("<div class='zem-label'>Maximum stories per topic</div>", unsafe_allow_html=True)
-        cap=st.slider("Cap per topic",2,8,6,key="cap")
-
-        strict = st.toggle("Strict timing (playback adjusted to exact length)", value=True, key="strict")
-
-        submitted = st.form_submit_button("🚀 Generate Noah", use_container_width=True)
-
-# Generate
-if submitted:
-    queries = [q for q in (topics_raw.replace(",", "\n").split("\n")) if q.strip()]
-    if not queries:
-        st.sidebar.error("Please add at least one topic.")
-    else:
-        payload = {
-            "queries": queries,
-            "language": language,
-            "tone": tone,
-            "recent_hours": int(lookback),
-            "per_feed": 6,
-            "cap_per_query": int(cap),
-            "min_minutes": int(minutes),
-            "minutes_target": int(minutes),
-            "exact_minutes": True,
-        }
-        if voice_id and voice_id!="__custom__":
-            payload["voice_id"] = voice_id
-
-        payload_json = json.dumps(payload, sort_keys=True)
-        with st.status("Generating your Noah… this can take 30–60 seconds", expanded=True) as s:
-            try:
-                s.write("Contacting Noah API…")
-                t0=time.time()
-                data = generate_cached(payload_json)
-                s.write(f"Received in {time.time()-t0:.1f}s")
-                s.update(label="Done ✓", state="complete")
-
-                st.session_state.noah_result = {
-                    "data": data,
-                    "minutes": int(minutes),
-                    "strict": bool(strict),
-                }
-                st.session_state.last_payload_json = payload_json
-            except Exception as e:
-                s.update(label="Failed ✗", state="error")
-                st.error(str(e))
-
-# Render last result
-res = st.session_state.noah_result
-L,R = st.columns([0.5,0.5])
-if res and isinstance(res, dict):
-    data = res.get("data") or {}
-    minutes = res.get("minutes") or 0
-    strict = res.get("strict") or False
-
-    with L:
-        st.markdown("<h3>Bullet points</h3>", unsafe_allow_html=True)
-        st.markdown(f"<div class='zem-card'>{(data.get('bullet_points') or '').replace(chr(10),'<br/>')}</div>", unsafe_allow_html=True)
-        st.markdown("<h3 style='margin-top:16px'>Narration script</h3>", unsafe_allow_html=True)
-        st.markdown(f"<div class='zem-card' style='white-space:pre-wrap'>{data.get('script') or ''}</div>", unsafe_allow_html=True)
-
-    with R:
-        st.markdown("<h3>Your briefing</h3>", unsafe_allow_html=True)
-        render_audio_and_link(
-            mp3_url=data.get("mp3_url",""),
-            actual_sec=float(data.get("duration_seconds") or 0),
-            target_min=int(minutes),
-            rate_hint=float(data.get("playback_rate_applied") or 1.0) if strict else 1.0,
-        )
-        st.markdown("<h4 style='margin-top:16px'>Sources used</h4>", unsafe_allow_html=True)
-        src=data.get("sources") or {}
-        if not src:
-            st.caption("No sources returned.")
+# --------- Trigger generation ----------
+if go:
+    queries = [q.strip() for q in topics.splitlines() if q.strip()]
+    payload = {
+        "queries": queries,
+        "language": lang,
+        "tone": tone,
+        "recent_hours": lookback,
+        "per_feed": 4,
+        "cap_per_query": cap,
+        "min_minutes": minutes,
+        "exact_minutes": bool(strict),
+        "voice_id": voice_id or None
+    }
+    with st.status("Contacting Noah API…", state="running", expanded=True) as stat:
+        # 1) POST /generate -> job_id
+        r = call_with_retry("POST", f"{API_BASE}/generate", json=payload)
+        if not r.ok:
+            st.error(f"API {r.status_code}: {r.text[:400]}")
         else:
-            html=["<details open><summary>Show sources</summary><div>"]
-            for q, items in src.items():
-                html.append(f"<div style='margin:6px 0'><b>{q}</b></div>")
-                for it in items or []:
-                    html.append(f"<div style='margin-left:10px'>• {it.get('title','(untitled)')} — {it.get('source','')} — <a href='{it.get('link','#')}' target='_blank' rel='noopener'>link</a></div>")
-            html.append("</div></details>")
-            st.markdown("".join(html), unsafe_allow_html=True)
-else:
-    st.info("Enter topics on the left and click **Generate Noah** to try the beta.")
+            job_id = r.json().get("job_id")
+            st.write(f"Started job: `{job_id}`")
+
+            # 2) Poll /result/{job_id}
+            start = time.time()
+            res = None
+            while True:
+                time.sleep(2.0)
+                rr = call_with_retry("GET", f"{API_BASE}/result/{job_id}")
+                js = rr.json()
+                if js.get("status") == "done":
+                    res = js.get("result")
+                    break
+                if js.get("status") == "error":
+                    st.error(f"API job failed: {js.get('error','unknown error')[:400]}")
+                    res = None
+                    break
+                # timeout guard (6 minutes)
+                if time.time() - start > 360:
+                    st.error("Timeout waiting for API result.")
+                    res = None
+                    break
+
+            if res:
+                st.success(f"Received in {time.time()-start:.1f}s")
+                st.session_state.last = res
+
+# --------- Show result (persisted) ----------
+res = st.session_state.last
+if res:
+    col1, col2 = st.columns([1,1])
+    with col1:
+        st.subheader("Bullet points")
+        st.markdown(res["bullet_points"] or "-", unsafe_allow_html=False)
+    with col2:
+        st.subheader("Your briefing")
+        target_m = res.get("minutes_target", minutes)
+        actual_s = float(res.get("duration_seconds", 0))
+        st.caption(f"Target: {target_m} min • Actual: {actual_s/60:.1f} min "
+                   f"• Playback: {res.get('playback_rate_applied',1.0):.2f}x")
+        st.audio(f"{API_BASE}{res['mp3_url']}")
+        st.download_button("⬇️ Download MP3", data=requests.get(f"{API_BASE}{res['mp3_url']}", timeout=60).content,
+                           file_name="noah.mp3", mime="audio/mpeg", use_container_width=True)
+
+    with st.expander("Sources used"):
+        for topic, items in (res.get("sources") or {}).items():
+            st.markdown(f"**{topic}**")
+            for it in items:
+                ttl = it.get("title","")
+                link = it.get("link","#")
+                src = it.get("source","")
+                st.markdown(f"- {ttl} — *{src}* — [link]({link})")

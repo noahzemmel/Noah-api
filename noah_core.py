@@ -171,9 +171,9 @@ def measure_wpm(tts_provider: str, voice_id: Optional[str]) -> Tuple[float, str]
 
 def trim_silence(seg: AudioSegment, head_ms=300, tail_ms=400) -> AudioSegment:
     # Trim long leading/trailing silence, keep a tiny ambience
-    lead = detect_leading_silence(seg, silence_thresh=-40)
+    lead = detect_leading_silence(seg, silence_threshold=-40)
     rev = seg.reverse()
-    trail = detect_leading_silence(rev, silence_thresh=-40)
+    trail = detect_leading_silence(rev, silence_threshold=-40)
     seg = seg[max(0, lead - head_ms): len(seg) - max(0, trail - tail_ms)]
     return seg
 

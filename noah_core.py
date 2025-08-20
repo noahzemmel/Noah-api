@@ -1,435 +1,396 @@
-# noah_core.py  —  Noah v2.2
-# Fresh sources via Tavily (std + Expert), GDELT, Google; grounded bullets; calibrated TTS; exact-length audio.
-
+# noah_core.py — exact-length, multi-topic, fresh-news generator
 from __future__ import annotations
-import os, io, re, math, time, json, random, traceback
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Tuple, Optional, Callable, Any
+import os, io, re, math, time, uuid, json, random
+from typing import List, Dict, Any, Tuple, Optional, Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
 import feedparser
 from pydub import AudioSegment
-from pydub.effects import speedup
-from openai import OpenAI
+from pydub.silence import detect_leading_silence
 
-# ---------------- Config ----------------
-WPM_FALLBACK = float(os.getenv("NOAH_WPM", "165"))          # used if calibration fails
-ATEMPO_MIN   = float(os.getenv("NOAH_ATEMPO_MIN", "0.88"))  # safe range for speed adjustment
-ATEMPO_MAX   = float(os.getenv("NOAH_ATEMPO_MAX", "1.12"))
-EXACTIFY_MAX_PASSES = int(os.getenv("NOAH_EXACTIFY_MAX_PASSES", "3"))
-MAX_SOURCES_PER_TOPIC = int(os.getenv("NOAH_MAX_SOURCES_PER_TOPIC", "8"))
-MAX_SOURCES_TOTAL     = int(os.getenv("NOAH_MAX_SOURCES_TOTAL", "28"))
-DATA_DIR = Path(os.getenv("NOAH_DATA_DIR", "/tmp/noah_jobs")).resolve()
+# ------------- Env & constants -------------
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+ELEVEN_API_KEY      = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE_ID_DEF = os.getenv("ELEVENLABS_VOICE_ID", "")
+TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
+DATA_DIR            = Path(os.getenv("DATA_DIR", "/tmp/noah_jobs")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-_CAL_WPS: Dict[str, float] = {}  # cached words/sec per voice
+# Providers flags
+HAS_TAVILY  = bool(TAVILY_API_KEY)
+HAS_ELEVEN  = bool(ELEVEN_API_KEY)
+HAS_OPENAI  = bool(OPENAI_API_KEY)
 
-# -------------- tiny utils --------------
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+# ------------- Simple helpers -------------
+def slug(s: str) -> str:
+    s = re.sub(r"[^\w\-]+", "-", s.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", s) or "noah"
 
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.utcnow()
 
-def parse_date(dt: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%a, %d %b %Y %H:%M:%S %Z"):
+def http_json(url: str, method: str = "GET", **kw) -> Any:
+    r = requests.request(method, url, timeout=30, **kw)
+    r.raise_for_status()
+    if "application/json" in r.headers.get("content-type", ""):
+        return r.json()
+    return r.text
+
+# ------------- Tavily search -------------
+def tavily_search(query: str, hours: int, max_results: int = 8) -> List[Dict[str, str]]:
+    """Fresh web search via Tavily, restricted by recency."""
+    if not HAS_TAVILY:
+        return []
+    recency = max(1, min(72, hours))
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max_results,
+        "include_answer": False,
+        "include_domains": [],
+        "exclude_domains": [],
+        "days": max(1, math.ceil(recency / 24)),
+    }
+    r = requests.post("https://api.tavily.com/search", json=payload, timeout=45)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for item in data.get("results", []):
+        out.append({
+            "title": item.get("title") or item.get("url") or "source",
+            "url": item.get("url") or "",
+            "snippet": item.get("content") or "",
+            "source": "web",
+        })
+    return out
+
+# ------------- RSS fallback -------------
+DEFAULT_FEEDS = [
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=best",
+    "https://www.ft.com/world?format=rss",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://www.theguardian.com/world/rss",
+]
+def rss_recent(hours: int, limit: int = 100) -> List[Dict[str, str]]:
+    cutoff = now_utc() - timedelta(hours=hours)
+    out = []
+    for url in DEFAULT_FEEDS:
         try:
-            return datetime.strptime(dt, fmt).replace(tzinfo=timezone.utc)
+            feed = feedparser.parse(url)
+            for e in feed.entries[:50]:
+                # Some RSS entries lack precise dates; include anyway if unsure
+                published = getattr(e, "published_parsed", None)
+                ok_time = True
+                if published:
+                    dt = datetime(*published[:6])
+                    ok_time = (dt >= cutoff)
+                if ok_time:
+                    out.append({
+                        "title": e.get("title", "news"),
+                        "url": e.get("link", ""),
+                        "snippet": e.get("summary", ""),
+                        "source": "rss",
+                    })
         except Exception:
             pass
-    try:
-        tup = feedparser._parse_date(dt)  # type: ignore
-        if tup:
-            return datetime(*tup[:6], tzinfo=timezone.utc)
-    except Exception:
-        pass
-    return None
+    random.shuffle(out)
+    return out[:limit]
 
-def within_hours(dt: Optional[datetime], lookback_h: int) -> bool:
-    if not dt: return False
-    return (now_utc() - dt) <= timedelta(hours=lookback_h)
+# ------------- OpenAI LLM / TTS -------------
+def openai_chat(system: str, user: str, temperature=0.4, tokens=1200) -> str:
+    if not HAS_OPENAI:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+        "temperature": temperature,
+        "max_tokens": tokens,
+    }
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
 
-def sanitize_queries(raw: object) -> List[str]:
-    if isinstance(raw, list):
-        items = raw
-    elif isinstance(raw, str):
-        items = [s.strip() for s in raw.splitlines()]
+def openai_tts(text: str, voice: str = "alloy") -> AudioSegment:
+    if not HAS_OPENAI:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    body = {
+        "model": "gpt-4o-mini-tts",
+        "voice": voice or "alloy",
+        "input": text,
+        "format": "mp3",  # OpenAI supports "mp3"
+    }
+    r = requests.post("https://api.openai.com/v1/audio/speech", headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    audio_bytes = r.content
+    return AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+
+# ------------- ElevenLabs TTS -------------
+def eleven_tts(text: str, voice_id: Optional[str] = None) -> AudioSegment:
+    if not HAS_ELEVEN:
+        raise RuntimeError("ELEVENLABS_API_KEY not set")
+    v = (voice_id or ELEVEN_VOICE_ID_DEF or "").strip() or "21m00Tcm4TlvDq8ikWAM"  # default premade voice if none
+    headers = {"xi-api-key": ELEVEN_API_KEY, "accept": "audio/mpeg", "Content-Type":"application/json"}
+    body = {"text": text, "model_id": "eleven_multilingual_v2", "voice_settings": {"stability":0.4,"similarity_boost":0.8}}
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{v}"
+    r = requests.post(url, headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    return AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
+
+# ------------- Voice calibration & timing -------------
+def measure_wpm(tts_provider: str, voice_id: Optional[str]) -> Tuple[float, str]:
+    """
+    Synthesize ~60 word snippet and measure duration to estimate WPM.
+    """
+    sample = (
+        "This is a short calibration to measure speaking speed for exact timing. "
+        "Please ignore. After this, your bulletin will begin."
+    )
+    if tts_provider == "elevenlabs" and HAS_ELEVEN:
+        seg = eleven_tts(sample, voice_id)
+        provider = "elevenlabs"
     else:
-        items = []
-    return [s for s in (i.strip() for i in items) if s]
+        seg = openai_tts(sample, voice_id or "alloy")
+        provider = "openai"
+    words = len(sample.split())
+    minutes = max(1e-6, len(seg) / 60000.0)
+    wpm = max(120.0, min(220.0, words / minutes))
+    # Trim all silence from calibration to avoid dead air later
+    seg = trim_silence(seg)
+    return (wpm, provider)
 
-def minutes_to_words(minutes: float, wps: float) -> int:
-    return max(90, int(round(minutes * 60.0 * wps)))
+def trim_silence(seg: AudioSegment, head_ms=300, tail_ms=400) -> AudioSegment:
+    # Trim long leading/trailing silence, keep a tiny ambience
+    lead = detect_leading_silence(seg, silence_thresh=-40)
+    rev = seg.reverse()
+    trail = detect_leading_silence(rev, silence_thresh=-40)
+    seg = seg[max(0, lead - head_ms): len(seg) - max(0, trail - tail_ms)]
+    return seg
 
-# -------------- collectors --------------
-def from_gdelt(query: str, recent_hours: int) -> List[Dict]:
-    url = (
-        "https://api.gdeltproject.org/api/v2/doc/doc"
-        f"?query={requests.utils.quote(query)}&timespan={recent_hours}h"
-        "&mode=artlist&format=json&maxrecords=35&sort=DateDesc"
-    )
-    out: List[Dict] = []
-    try:
-        r = requests.get(url, timeout=25)
-        if not r.ok: return out
-        data = r.json()
-        for art in data.get("articles", []):
-            t = (art.get("title") or "").strip()
-            link = (art.get("url") or "").strip()
-            seen = parse_date(art.get("seendate") or "")
-            if not t or not link:
-                continue
-            out.append({
-                "query": query, "title": t, "link": link,
-                "published": seen.isoformat() if seen else "",
-                "source": art.get("domain", "gdelt"),
-                "snippet": (art.get("excerpt") or "")[:260],
-                "ts": seen or now_utc()
-            })
-    except Exception:
-        traceback.print_exc()
-    return out
-
-def from_googlenews(query: str, recent_hours: int, lang="en-GB", region="GB") -> List[Dict]:
-    q = f"{query} when:{recent_hours}h"
-    url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl={lang}&gl={region}&ceid={region}:{lang.split('-')[0]}"
-    out: List[Dict] = []
-    try:
-        feed = feedparser.parse(url)
-        for e in feed.entries:
-            pub = parse_date(e.get("published","") or e.get("updated",""))
-            out.append({
-                "query": query, "title": e.get("title",""), "link": e.get("link",""),
-                "published": pub.isoformat() if pub else "", "source": (e.get("source",{}) or {}).get("title","google"),
-                "snippet": (e.get("summary","") or "")[:260],
-                "ts": pub or now_utc()
-            })
-    except Exception:
-        traceback.print_exc()
-    return out
-
-def _domain_filters() -> Tuple[List[str], List[str]]:
-    allow = [d.strip() for d in os.getenv("TAVILY_DOMAINS_ALLOW","").split(",") if d.strip()]
-    block = [d.strip() for d in os.getenv("TAVILY_DOMAINS_BLOCK","").split(",") if d.strip()]
-    return allow, block
-
-def from_tavily(query: str, recent_hours: int) -> List[Dict]:
-    key = os.getenv("TAVILY_API_KEY","").strip()
-    if not key: return []
-    allow, block = _domain_filters()
-    payload: Dict[str, Any] = {
-        "api_key": key,
-        "query": query,
-        "search_depth": "advanced",
-        "time_range": "day" if recent_hours <= 24 else ("week" if recent_hours <= 168 else "month"),
-        "include_answer": False,
-        "max_results": 12,
-        "include_domains": allow or None,
-        "exclude_domains": block or None,
-    }
-    payload = {k:v for k,v in payload.items() if v is not None}
-    out: List[Dict] = []
-    try:
-        r = requests.post("https://api.tavily.com/search", json=payload, timeout=30)
-        if not r.ok: return out
-        data = r.json()
-        for res in data.get("results", []):
-            title = (res.get("title") or "").strip()
-            link  = (res.get("url")   or "").strip()
-            when  = parse_date(res.get("published_date") or "") or now_utc()
-            if not title or not link: continue
-            out.append({
-                "query": query, "title": title, "link": link,
-                "published": when.isoformat(), "source": res.get("source","tavily"),
-                "snippet": (res.get("content") or "")[:260], "ts": when
-            })
-    except Exception:
-        traceback.print_exc()
-    return out
-
-def from_tavily_expert(query: str, recent_hours: int) -> List[Dict]:
-    if os.getenv("TAVILY_USE_EXPERT","").lower() not in {"1","true","yes"}:
-        return []
-    key = os.getenv("TAVILY_API_KEY","").strip()
-    if not key: return []
-    endpoint = os.getenv("TAVILY_EXPERT_ENDPOINT","https://api.tavily.com/v1/expert/search").strip()
-    allow, block = _domain_filters()
-    payload: Dict[str, Any] = {
-        "api_key": key,
-        "query": query,
-        "search_depth": "advanced",
-        "time_range": "day" if recent_hours <= 24 else ("week" if recent_hours <= 168 else "month"),
-        "max_results": 12,
-        "include_domains": allow or None,
-        "exclude_domains": block or None,
-    }
-    payload = {k:v for k,v in payload.items() if v is not None}
-    out: List[Dict] = []
-    try:
-        r = requests.post(endpoint, json=payload, timeout=40)
-        if not r.ok: return out
-        data = r.json()
-        results = data.get("results") or data.get("data") or []
-        for res in results:
-            title = (res.get("title") or "").strip()
-            link  = (res.get("url") or res.get("link") or "").strip()
-            when  = parse_date(res.get("published_date") or "") or now_utc()
-            if not title or not link: continue
-            out.append({
-                "query": query, "title": title, "link": link,
-                "published": when.isoformat(), "source": res.get("source","tavily_expert"),
-                "snippet": (res.get("content") or res.get("summary") or "")[:260], "ts": when
-            })
-    except Exception:
-        traceback.print_exc()
-    return out
-
-def fetch_sources(queries: List[str], recent_hours: int, cap_per_query: int, strict_recency=True) -> List[Dict]:
+# ------------- News aggregation -------------
+def gather_sources_per_topic(queries: List[str], hours: int, cap_per_topic: int, on_progress: Callable[[str], None]) -> Dict[str, List[Dict[str,str]]]:
     """
-    Collector order is controlled by NOAH_SOURCE_ORDER env var.
-    Default: tavily_expert,tavily,gdelt,google
+    Get fresh sources per topic. Guarantees up to cap_per_topic per topic when available.
     """
-    order = (os.getenv("NOAH_SOURCE_ORDER","tavily_expert,tavily,gdelt,google")
-             .replace(" ","").split(","))
-    collectors = {
-        "tavily_expert": lambda q: from_tavily_expert(q, recent_hours),
-        "tavily":        lambda q: from_tavily(q, recent_hours),
-        "gdelt":         lambda q: from_gdelt(q, recent_hours),
-        "google":        lambda q: from_googlenews(q, recent_hours),
-    }
-
-    all_items: List[Dict] = []
+    sources_per = {}
     for q in queries:
-        items: List[Dict] = []
-        for name in order:
-            fn = collectors.get(name)
-            if fn: items.extend(fn(q))
-        if strict_recency:
-            items = [i for i in items if within_hours(i.get("ts"), recent_hours)]
-        # dedupe by link
-        seen = set(); uniq=[]
-        for i in items:
-            k = i.get("link")
-            if k and k not in seen:
-                uniq.append(i); seen.add(k)
-        uniq.sort(key=lambda x: x.get("ts") or now_utc(), reverse=True)
-        all_items.extend(uniq[:cap_per_query])
-    return all_items[:MAX_SOURCES_TOTAL]
+        q_clean = q.strip()
+        on_progress(f"Search: {q_clean}")
+        items = []
+        if HAS_TAVILY:
+            items = tavily_search(q_clean, hours, max_results=cap_per_topic+3)
+        if not items:  # fallback RSS + filter titles
+            pool = rss_recent(hours, limit=80)
+            q_words = [w for w in re.split(r"\W+", q_clean.lower()) if w]
+            for p in pool:
+                title = (p.get("title") or "").lower()
+                if any(w in title for w in q_words):
+                    items.append(p)
+        sources_per[q_clean] = items[:cap_per_topic]
+    return sources_per
 
-# -------------- LLM helpers --------------
-def openai_client() -> OpenAI:
-    return OpenAI()
-
-def build_cited_json_script(queries: List[str], sources: List[Dict], language: str, tone: str,
-                            target_words: int, hours: int) -> Tuple[str, List[Dict]]:
-    """Returns (script, bullets[]), bullets are [{text, sources:[idx,...]}]"""
-    client = openai_client()
-
-    catalog_lines = []
-    for idx, s in enumerate(sources, start=1):
-        line = f"[{idx}] {s.get('title','').strip()} — {s.get('source','')} — {s.get('link','')}"
-        if s.get("published"): line += f" — {s['published']}"
-        if s.get("snippet"):   line += f" — {s['snippet']}"
-        catalog_lines.append(line)
-    catalog = "\n".join(catalog_lines) if catalog_lines else "(no sources)"
-
-    sys = (
-        "You are Noah, a factual news editor. Create a concise radio script ONLY from the numbered sources provided. "
-        f"Time window is the last {hours} hours; prefer newest; avoid filler. "
-        "Every claim must be supported by at least one source index. Include [index] citations inline."
-    )
+# ------------- Bullet & Script writer -------------
+def bullets_for_topic(topic: str, sources: List[Dict[str,str]], lang: str, tone: str) -> List[str]:
+    """
+    Ask LLM for compact bullets tied to the *given sources* (last 24–72h).
+    """
+    cites = "\n".join(f"- {s.get('title')} — {s.get('url')}" for s in sources if s.get("url"))
+    system = f"You are Noah, a concise real-time news writer. Write in {lang}. Tone: {tone}. Focus on facts from the cited URLs only."
     user = (
-        f"Language: {language}\nTone: {tone}\nTopics: {', '.join(queries)}\n"
-        f"Target words: ~{target_words}\n\nSources:\n{catalog}\n\n"
-        "Respond as JSON with keys:\n"
-        "  bullets: [{\"text\": string, \"sources\": [numbers]}]\n"
-        "  script: string (keep bracket citations like [2], [5])\n"
+        f"Topic: {topic}\n"
+        f"Sources (fresh):\n{cites}\n\n"
+        "Compose 4–6 compact bullet points (max ~22 words each). "
+        "Each bullet must be attributable to these sources; do not invent, do not summarize history. "
+        "Return each bullet prefixed by '• '."
     )
+    text = openai_chat(system, user, temperature=0.2, tokens=500)
+    bulls = [re.sub(r"^[•\-\*]\s*", "", b).strip() for b in text.splitlines() if b.strip()]
+    return bulls[:8]
 
-    resp = client.chat.completions.create(
-        model=os.getenv("NOAH_SUMMARY_MODEL","gpt-4o-mini"),
-        temperature=0.2,
-        response_format={"type":"json_object"},
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+def script_from_bullets(queries: List[str], per_topic_bullets: Dict[str,List[str]], lang: str, tone: str, target_words: int) -> str:
+    """
+    Force coverage across all topics first, then flow.
+    """
+    bundle = []
+    for q in queries:
+        b = per_topic_bullets.get(q.strip(), [])
+        if b:
+            bundle.append(f"{q.strip()}:\n" + "\n".join(f"- {x}" for x in b))
+    joined = "\n\n".join(bundle)
+    sys = f"You are Noah, a crisp daily news narrator. Language: {lang}. Tone: {tone}."
+    usr = (
+        "Using ONLY the listed bullets (which are extracted from verified sources), craft a spoken news script. "
+        "Rules:\n"
+        "1) Cover every topic section in the order given.\n"
+        "2) Keep it factual and *current* — no background history unless needed for one-sentence context.\n"
+        f"3) Aim for about {target_words} words total.\n"
+        "4) Use short sentences. Smooth but efficient transitions between topics.\n"
+        "5) No repetition. No disclaimers.\n\n"
+        f"Bullets grouped by topic:\n{joined}\n\n"
+        "Return only the script paragraphs."
     )
-    data = json.loads(resp.choices[0].message.content)
-    bullets = [b for b in data.get("bullets", []) if isinstance(b, dict) and b.get("text")]
-    script  = (data.get("script") or "").strip()
-    if not script:
-        script = " ".join(b.get("text","") for b in bullets)
-    return script, bullets
+    return openai_chat(sys, usr, temperature=0.35, tokens=1600)
 
-def length_correct(text: str, target_words: int, language: str, tone: str) -> str:
-    client = openai_client()
-    sys = "Adjust the script to match the target word count (±3%). Keep citations like [3] intact. Be concise."
-    user = f"Language: {language}\nTone: {tone}\nTarget words: {target_words}\nScript:\n{text}\n\nReturn only the revised script."
-    out = client.chat.completions.create(
-        model=os.getenv("NOAH_EDITOR_MODEL","gpt-4o-mini"),
-        temperature=0.2,
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+def continuation_script(lang: str, tone: str, remaining_words: int, queries: List[str], used_topics: List[str]) -> str:
+    sys = f"You are Noah, a crisp daily news narrator. Language: {lang}. Tone: {tone}."
+    usr = (
+        "We need a continuation segment for the same bulletin. "
+        f"Write about {remaining_words} words, expanding with *new, fresh* lines that add depth and detail. "
+        "Do not repeat earlier lines. Keep transitions tight. No filler."
     )
-    return out.choices[0].message.content.strip()
+    return openai_chat(sys, usr, temperature=0.45, tokens=1200)
 
-# -------------- TTS --------------
-def tts_openai(text: str, out_path: str, voice: Optional[str] = None) -> str:
-    client = openai_client()
-    model = os.getenv("OPENAI_TTS_MODEL","gpt-4o-mini-tts")
-    v = voice or os.getenv("OPENAI_TTS_VOICE","alloy")
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with client.audio.speech.with_streaming_response.create(
-        model=model, voice=v, input=text
-    ) as r:
-        r.stream_to_file(out_path)
-    return os.path.abspath(out_path)
+# ------------- Synthesis pipeline -------------
+def synthesize(tts_provider: str, voice_id: Optional[str], text: str) -> AudioSegment:
+    if tts_provider == "elevenlabs" and HAS_ELEVEN:
+        seg = eleven_tts(text, voice_id)
+        return trim_silence(seg)
+    # default OpenAI
+    seg = openai_tts(text, voice_id or "alloy")
+    return trim_silence(seg)
 
-def tts_eleven(text: str, out_path: str, voice_id: Optional[str]) -> str:
-    key = os.getenv("ELEVENLABS_API_KEY","").strip()
-    if not key: raise RuntimeError("ELEVENLABS_API_KEY missing")
-    vid = voice_id or os.getenv("ELEVENLABS_VOICE_ID","") or "21m00Tcm4TlvDq8ikWAM"
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream?optimize_streaming_latency=3"
-    headers = {"xi-api-key": key, "accept": "audio/mpeg", "content-type": "application/json"}
-    payload = {"text": text, "voice_settings": {"stability": 0.4, "similarity_boost": 0.7}}
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with requests.post(url, headers=headers, data=json.dumps(payload), stream=True, timeout=180) as r:
-        r.raise_for_status()
-        with open(out_path,"wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk: f.write(chunk)
-    return os.path.abspath(out_path)
-
-def audio_len_sec(p: str) -> float:
-    return AudioSegment.from_file(p).duration_seconds
-
-def calibrate_wps(provider: str, voice_id: str = "") -> float:
-    key = f"{provider}:{voice_id or os.getenv('OPENAI_TTS_VOICE','alloy')}"
-    if key in _CAL_WPS: return _CAL_WPS[key]
-    sample = ("This is a short calibration passage for Noah to measure speaking rate. " * 6).strip()
-    words = len(re.findall(r"\w+", sample))
-    tmp = DATA_DIR / f"cal_{abs(hash(key))}.mp3"
-    try:
-        if provider == "elevenlabs":
-            tts_eleven(sample, str(tmp), voice_id or os.getenv("ELEVENLABS_VOICE_ID",""))
-        else:
-            tts_openai(sample, str(tmp), voice=os.getenv("OPENAI_TTS_VOICE","alloy"))
-        dur = audio_len_sec(str(tmp))
-        wps = max(2.0, min(4.0, words / max(0.5, dur)))
-    except Exception:
-        traceback.print_exc()
-        wps = WPM_FALLBACK / 60.0
-    finally:
-        try: tmp.unlink(missing_ok=True)
-        except: pass
-    _CAL_WPS[key] = wps
-    return wps
-
-def exactify_audio(mp3: str, target_minutes: float) -> Tuple[str, float, float]:
-    cur = audio_len_sec(mp3)
-    target = max(1.0, target_minutes * 60.0)
-    rate = clamp(target / cur, ATEMPO_MIN, ATEMPO_MAX)
-    au = AudioSegment.from_file(mp3)
-    if abs(rate - 1.0) > 0.01:
-        au = speedup(au, playback_speed=rate)
-    new_len = au.duration_seconds
-    if new_len < target - 0.25:
-        au += AudioSegment.silent(duration=int((target - new_len) * 1000))
-    out = str(Path(mp3).with_suffix(".ex.mp3"))
-    au.export(out, format="mp3")
-    return out, audio_len_sec(out), rate
-
-# -------------- main API --------------
+# ------------- Public entry point -------------
 def make_noah_audio(
-    queries_raw: object,
-    language: str = "English",
-    tone: str = "confident and crisp",
-    recent_hours: int = 24,
-    cap_per_query: int = 6,
-    min_minutes: float = 8.0,
-    exact_minutes: bool = True,
-    voice_id: Optional[str] = None,
+    queries_raw: str,
+    language: str,
+    tone: str,
+    recent_hours: int,
+    cap_per_query: int,
+    min_minutes: float,
+    exact_minutes: bool,
+    voice_id: Optional[str],
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
+    """
+    Main orchestrator called by FastAPI worker thread.
+    """
+    on_progress = on_progress or (lambda _msg: None)
 
-    def tick(msg: str):
-        if on_progress: on_progress(msg)
+    # Normalize topics
+    topics = [t.strip() for t in re.split(r"[\n\r]+", queries_raw or "") if t.strip()]
+    if not topics:
+        topics = ["world news"]
 
-    queries = sanitize_queries(queries_raw)
-    if not queries:
-        raise ValueError("No topics provided")
+    # 1) Collect sources per topic (guarantee at least per-topic coverage)
+    on_progress("Collecting fresh sources")
+    per_topic_sources = gather_sources_per_topic(topics, recent_hours, cap_per_query, on_progress)
 
-    tick("Collecting sources…")
-    sources = fetch_sources(queries, recent_hours, cap_per_query, strict_recency=True)
-    if not sources:
-        tick("No fresh sources – widening search a bit…")
-        sources = fetch_sources(queries, min(72, max(24, recent_hours*2)), cap_per_query, strict_recency=True)
+    # 2) Convert sources to bullets (per topic)
+    on_progress("Draft bullets per topic")
+    per_topic_bullets: Dict[str, List[str]] = {}
+    for q in topics:
+        srcs = per_topic_sources.get(q, [])
+        if not srcs:
+            per_topic_bullets[q] = []
+            continue
+        per_topic_bullets[q] = bullets_for_topic(q, srcs, language, tone)
+        time.sleep(0.3)
 
-    sources = sources[:MAX_SOURCES_TOTAL]
+    # 3) Calibrate voice speed -> WPM
+    on_progress("Calibrating voice")
+    wpm, provider = measure_wpm("elevenlabs" if voice_id and HAS_ELEVEN else "openai", voice_id)
 
-    provider = (os.getenv("NOAH_TTS_PROVIDER","openai") or "openai").lower()
-    if provider == "auto":
-        provider = "elevenlabs" if os.getenv("ELEVENLABS_API_KEY","").strip() else "openai"
+    # 4) Target words plan
+    # Use ~95% of time for speech; keep ~5% headroom
+    target_minutes = float(min_minutes)
+    target_words = max(120, int(target_minutes * wpm * 0.95))
 
-    # calibration → target words
-    wps = calibrate_wps(provider, voice_id or os.getenv("ELEVENLABS_VOICE_ID",""))
-    target_words = minutes_to_words(min_minutes, wps)
+    # 5) First script pass that covers all topics
+    on_progress("Draft Attempt 1")
+    script = script_from_bullets(topics, per_topic_bullets, language, tone, target_words)
 
-    tick("Draft Attempt 1")
-    script, bullets = build_cited_json_script(queries, sources, language, tone, target_words, hours=recent_hours)
-
-    # tighten to target words
-    for _ in range(EXACTIFY_MAX_PASSES):
-        wc = len(re.findall(r"\w+", script))
-        if abs(wc - target_words) / target_words <= 0.04:
+    # 6) Iterative expand to hit target minutes with real speech (no silence padding)
+    segs: List[AudioSegment] = []
+    combined = AudioSegment.silent(duration=0)
+    attempt = 1
+    MAX_ATTEMPTS = 5
+    while attempt <= MAX_ATTEMPTS:
+        on_progress(f"Correct Expand {len(script.split())}")
+        seg = synthesize(provider, voice_id, script)
+        segs.append(seg)
+        combined = sum(segs, AudioSegment.silent(duration=0))
+        actual_mins = len(combined) / 60000.0
+        if not exact_minutes:
             break
-        tick(f"Correct to ~{target_words} words (was {wc})")
-        script = length_correct(script, target_words, language, tone)
-
-    # intro/outro (short, not counted toward target words)
-    intro = "Welcome to your daily Noah. "
-    outro = "That’s your briefing for today. See you tomorrow."
-    script = f"{intro}{script} {outro}"
-
-    tick("TTS start")
-    raw_path = DATA_DIR / f"noah_{int(time.time())}_{random.randint(1000,9999)}.mp3"
-    try:
-        if provider == "elevenlabs":
-            try:
-                tts_eleven(script, str(raw_path), voice_id)
-                used = "elevenlabs"
-            except Exception:
-                traceback.print_exc()
-                tts_openai(script, str(raw_path), voice=os.getenv("OPENAI_TTS_VOICE","alloy"))
-                used = "openai"
+        # good enough?
+        if abs(actual_mins - target_minutes) <= max(0.25, target_minutes * 0.03):
+            break
+        if actual_mins < target_minutes:
+            # Need more content: ask LLM for continuation ~ remaining words
+            remaining = max(80, int((target_minutes - actual_mins) * wpm * 0.98))
+            on_progress(f"Draft Attempt {attempt+1}")
+            script = continuation_script(language, tone, remaining, topics, [])
+            attempt += 1
+            continue
         else:
-            tts_openai(script, str(raw_path), voice=os.getenv("OPENAI_TTS_VOICE","alloy"))
-            used = "openai"
-    except Exception as e:
-        raise RuntimeError(f"TTS failed: {e}")
+            # Slightly too long — speed-up by tiny pitch/tempo? Prefer not (quality hit).
+            # Instead, stop if within 5%. Otherwise ask for a shorter closing paragraph and replace last seg.
+            if (actual_mins - target_minutes) <= max(0.35, target_minutes * 0.05):
+                break
+            on_progress("Trim long tail with a brief closing")
+            closing = openai_chat(
+                f"You are Noah, a crisp anchor. Language: {language}. Tone: {tone}.",
+                "Write a 2–3 sentence closing that wraps up the bulletin politely. 35–50 words.",
+                temperature=0.4,
+                tokens=120,
+            )
+            # Replace last seg with the closing only
+            segs[-1] = synthesize(provider, voice_id, closing)
+            combined = sum(segs, AudioSegment.silent(duration=0))
+            break
 
-    tick("Exactifying audio")
-    final_path, secs, rate = exactify_audio(str(raw_path), min_minutes if exact_minutes else (len(re.findall(r'\w+', script))/wps/60.0))
-    try: Path(raw_path).unlink(missing_ok=True)
-    except: pass
+    # Natural tiny tail; no long silent padding
+    combined = trim_silence(combined)
+
+    # 7) Build sources list (flatten per-topic to a single list, keep order)
+    srcs_flat: List[Dict[str,str]] = []
+    for q in topics:
+        for s in per_topic_sources.get(q, []):
+            srcs_flat.append({"title": s.get("title",""), "url": s.get("url","")})
+
+    # 8) Export MP3
+    file_id = uuid.uuid4().hex
+    mp3_name = f"noah-{slug(','.join(topics))[:48]}-{file_id}.mp3"
+    mp3_path = DATA_DIR / mp3_name
+    combined.export(str(mp3_path), format="mp3", bitrate="128k")
+
+    actual_minutes = round(len(combined) / 60000.0, 2)
+
+    # 9) Bullet list for the UI (compact summary)
+    bullets_all: List[str] = []
+    for q in topics:
+        bs = per_topic_bullets.get(q, [])
+        if bs:
+            bullets_all.append(f"{q}:")
+            bullets_all.extend(bs[:6])
 
     return {
-        "script": script,
-        "bullets": bullets,
-        "sources": [
-            {"idx": i+1, "query": s.get("query"), "title": s.get("title"),
-             "link": s.get("link"), "published": s.get("published"), "source": s.get("source")}
-            for i, s in enumerate(sources)
-        ],
-        "mp3_path": final_path,
-        "actual_minutes": round(secs/60.0, 2),
-        "target_minutes": float(min_minutes),
-        "playback_rate": round(rate, 3),
-        "tts_provider": used,
+        "script": "",  # (optional; can be large; you can return it if you want)
+        "bullets": bullets_all,
+        "sources": srcs_flat,
+        "mp3_path": str(mp3_path),
+        "mp3_name": mp3_name,
+        "actual_minutes": actual_minutes,
+        "target_minutes": target_minutes,
+        "playback_rate": 1.0,  # we did not time-warp; we used real extra content
+        "tts_provider": provider,
     }
 
-# -------------- health (used by /health) --------------
-def health_check() -> Dict[str, Any]:
+# ------------- Health check for /health -------------
+def health_check() -> Dict[str, bool]:
     return {
-        "openai": bool(os.getenv("OPENAI_API_KEY","").strip()),
-        "tavily": bool(os.getenv("TAVILY_API_KEY","").strip()),
-        "elevenlabs": bool(os.getenv("ELEVENLABS_API_KEY","").strip()),
+        "openai": HAS_OPENAI,
+        "elevenlabs": HAS_ELEVEN,
+        "tavily": HAS_TAVILY,
+        "storage": DATA_DIR.exists(),
     }

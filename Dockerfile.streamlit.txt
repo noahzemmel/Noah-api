@@ -1,0 +1,19 @@
+# UI: Streamlit
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py /app/
+
+# Streamlit uses port 8501 by default; respect Render's $PORT
+ENV PORT=8501
+ENV STREAMLIT_SERVER_PORT=$PORT
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_BROWSER_GATHERUSAGESTATS=false
+
+CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0

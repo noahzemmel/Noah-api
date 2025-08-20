@@ -1,4 +1,5 @@
-# server.py — async jobs with progress; resilient to long runs
+# server.py — async jobs with progress + TTS provider surfaced + OpenAI voices listed
+
 import os, uuid, time, threading
 from pathlib import Path
 from typing import Dict, Any
@@ -10,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from noah_core import make_noah_audio, health_check
 
 APP_NAME = "Noah API"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 app = FastAPI(title=APP_NAME, version=VERSION)
 
@@ -36,7 +37,6 @@ def _background_generate(job_id: str, payload: Dict[str, Any]) -> None:
         if meta:
             meta["progress"] = stage
             meta["updated_at"] = _now()
-
     try:
         queries = payload.get("queries") or []
         if isinstance(queries, str):
@@ -68,6 +68,7 @@ def _background_generate(job_id: str, payload: Dict[str, Any]) -> None:
                 "duration_seconds": result["duration_seconds"],
                 "minutes_target": result["minutes_target"],
                 "playback_rate_applied": result["playback_rate_applied"],
+                "tts_provider": result.get("tts_provider",""),
                 "mp3_url": mp3_url,
                 "calibrated_wps": result.get("calibrated_wps"),
                 "narration_word_count": result.get("narration_word_count"),
@@ -91,9 +92,10 @@ def _start_job(payload: Dict[str, Any]) -> str:
 
 def _prune_jobs() -> None:
     now = _now()
-    expired = [jid for jid, meta in JOBS.items() if now - meta.get("updated_at", now) > JOB_TTL_SECONDS]
-    for jid in expired:
-        JOBS.pop(jid, None)
+    for jid in list(JOBS.keys()):
+        meta = JOBS.get(jid) or {}
+        if now - meta.get("updated_at", now) > JOB_TTL_SECONDS:
+            JOBS.pop(jid, None)
 
 @app.get("/")
 def root():
@@ -106,14 +108,22 @@ def health():
 
 @app.get("/voices")
 def voices():
+    """Return ElevenLabs voices + a few OpenAI options."""
+    results = []
+    # ElevenLabs (best-effort)
     try:
         import requests
         r = requests.get("https://api.elevenlabs.io/v1/voices",
                          headers={"xi-api-key": os.getenv("ELEVENLABS_API_KEY","")}, timeout=20)
         out = r.json() if r.status_code == 200 else {"voices":[]}
+        for v in out.get("voices", []):
+            results.append({"id": v.get("voice_id"), "name": f"ElevenLabs: {v.get('name')}"})
     except Exception:
-        out = {"voices":[]}
-    return [{"id": v.get("voice_id"), "name": v.get("name")} for v in out.get("voices", [])]
+        pass
+    # OpenAI options
+    for name in ["alloy","verse","aria","sage"]:
+        results.append({"id": f"openai:{name}", "name": f"OpenAI: {name}"})
+    return results
 
 @app.post("/generate")
 def generate(payload: Dict[str, Any] = Body(...)):

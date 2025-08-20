@@ -1,415 +1,356 @@
-# noah_core.py — exact-length generation with TTS auto-fallback (ElevenLabs → OpenAI),
-# retries, faster calibration, and progress hooks.
+# noah_core.py
+# Noah Core: fetch -> summarize -> draft -> correct to target words -> TTS -> exactify duration -> return mp3 + sources
 
-import os, re, json, time, uuid, requests, feedparser
-from typing import Dict, List, Any, Tuple, Optional, Callable
-from datetime import datetime, timezone
+from __future__ import annotations
+import os, io, re, math, time, json, shutil, asyncio, traceback, tempfile, random
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Tuple, Callable, Optional
+from pathlib import Path
+
+import requests
+import feedparser
 from pydub import AudioSegment
+from pydub.effects import speedup
 from openai import OpenAI
 
-# --------- Paths & keys ---------
-DATA_DIR = os.getenv("NOAH_DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-WPS_CACHE_PATH = os.path.join(DATA_DIR, "wps_cache.json")
-WPS_CACHE_TTL_DAYS = int(os.getenv("NOAH_WPS_CACHE_DAYS", "30"))
+# --------------------------
+# Config via environment
+# --------------------------
+WPM_DEFAULT = float(os.getenv("NOAH_WPM", "165"))  # natural speaking rate
+EXACTIFY_MAX_PASSES = int(os.getenv("NOAH_EXACTIFY_MAX_PASSES", "2"))
+ATEMPO_MIN = float(os.getenv("NOAH_ATEMPO_MIN", "0.85"))   # ffmpeg limits: 0.5..2.0 per pass; keep conservative
+ATEMPO_MAX = float(os.getenv("NOAH_ATEMPO_MAX", "1.15"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-DEFAULT_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
-NOAH_TTS_PROVIDER = os.getenv("NOAH_TTS_PROVIDER", "auto").lower()  # auto | elevenlabs | openai
-OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")          # alloy, verse, aria, sage
+DATA_DIR = Path(os.getenv("NOAH_DATA_DIR", "/tmp/noah_jobs")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# At most ±15% speed change to preserve natural sound
-MIN_ATEMPO, MAX_ATEMPO = 0.85, 1.20
+# --------------------------
+# Utilities
+# --------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-LANG_WPS = {
-    "English": 2.6, "Spanish": 2.5, "French": 2.4, "German": 2.3, "Italian": 2.5,
-    "Portuguese": 2.5, "Arabic": 2.3, "Hindi": 2.5, "Japanese": 2.2, "Korean": 2.3,
-    "Chinese (Simplified)": 2.3
-}
-DEFAULT_WPS = 2.6
+def sanitize_queries(q: object) -> List[str]:
+    """Accept list or newline-separated string; strip empties."""
+    if isinstance(q, list):
+        arr = q
+    elif isinstance(q, str):
+        arr = [line.strip() for line in q.splitlines()]
+    else:
+        arr = []
+    return [s for s in (s.strip() for s in arr) if s]
 
-INTRO = {"English": "Welcome to your daily Noah."}
-OUTRO = {"English": "That's your Noah for today. See you tomorrow."}
+def minutes_to_words(minutes: float, wpm: float = WPM_DEFAULT) -> int:
+    return max(80, int(round(minutes * wpm)))
 
-# --------- Utils ---------
-def health_check() -> bool:
-    return bool(OPENAI_API_KEY and ELEVEN_API_KEY)
+def seconds_to_mmss(sec: float) -> str:
+    m = int(sec // 60)
+    s = int(round(sec % 60))
+    return f"{m}:{s:02d}"
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def word_count(s: str) -> int:
-    return len(re.findall(r"\b\w+\b", s))
+# --------------------------
+# Source collection
+# --------------------------
+def google_news_rss(query: str, recent_hours: int, lang="en-GB", region="GB") -> str:
+    # E.g., when:24h
+    when = f"when%3A{recent_hours}h" if recent_hours else ""
+    q = requests.utils.quote(f"{query} {when}".strip())
+    return f"https://news.google.com/rss/search?q={q}&hl={lang}&gl={region}&ceid={region}:{lang.split('-')[0]}"
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def openai_client() -> OpenAI:
-    return OpenAI(api_key=OPENAI_API_KEY)
-
-def _with_retries(fn, tries=3, base=1.0, factor=1.6):
-    last = None
-    for i in range(tries):
+def fetch_sources(queries: List[str], recent_hours: int, cap_per_query: int = 6) -> List[Dict]:
+    """Return list of {title, link, source, published} from Google News RSS."""
+    results = []
+    for q in queries:
+        url = google_news_rss(q, recent_hours)
         try:
-            r = fn()
-            if hasattr(r, "status_code") and r.status_code in (502, 503, 504):
-                raise requests.exceptions.RequestException(f"Upstream {r.status_code}")
-            return r
-        except Exception as e:
-            last = e
-            time.sleep(base * (factor ** i))
-    raise last
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:cap_per_query]:
+                results.append({
+                    "query": q,
+                    "title": entry.get("title", ""),
+                    "link": entry.get("link", ""),
+                    "published": entry.get("published", ""),
+                    "source": entry.get("source", {}).get("title", "") or entry.get("authors", [{}])[0].get("name",""),
+                })
+        except Exception:
+            traceback.print_exc()
+    return results
 
-# --------- Sources: Google News RSS (exclude Reddit) ---------
-def _google_news_rss(query: str, recent_hours: int) -> str:
-    q = requests.utils.quote(query)
-    when = f" when:{recent_hours}h" if recent_hours else ""
-    # hl/gl/ceid set to EN/GB for consistency
-    return f"https://news.google.com/rss/search?q={q}{requests.utils.quote(when)}&hl=en-GB&gl=GB&ceid=GB:en"
+# --------------------------
+# LLM helpers
+# --------------------------
+def get_openai_client() -> OpenAI:
+    return OpenAI()
 
-def fetch_sources(query: str, recent_hours: int, cap: int) -> List[Dict[str,str]]:
-    url = _google_news_rss(query, recent_hours)
-    try:
-        parsed = feedparser.parse(url)
-    except Exception:
-        return []
-    items, seen = [], set()
-    for e in parsed.entries:
-        title = (e.get("title") or "").strip()
-        link = (e.get("link") or "").strip()
-        src = ((e.get("source") or {}).get("title") or "").strip()
-        if not title or not link:  # must have both
-            continue
-        # filter low-quality sources
-        if "reddit" in link.lower():
-            continue
-        if link in seen:
-            continue
-        items.append({"title": title, "link": link, "source": src})
-        seen.add(link)
-        if len(items) >= cap:
-            break
-    return items
-
-def collect_sources(queries: List[str], recent_hours: int, cap: int) -> Dict[str,List[Dict[str,str]]]:
-    return {q: fetch_sources(q, recent_hours, cap) for q in queries}
-
-# --------- TTS: ElevenLabs + OpenAI fallback ---------
-def _resolve_eleven_voice(requested_id: Optional[str]) -> str:
-    vid = (requested_id or DEFAULT_VOICE_ID or "").strip()
-    if vid:
-        return vid
-    try:
-        r = _with_retries(lambda: requests.get(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={"xi-api-key": ELEVEN_API_KEY}, timeout=20))
-        voices = (r.json() or {}).get("voices") or []
-        if voices:
-            return voices[0].get("voice_id","")
-    except Exception:
-        pass
-    return ""  # unresolved
-
-def eleven_tts_bytes(text: str, voice_id: str) -> bytes:
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": ELEVEN_API_KEY, "accept":"audio/mpeg", "content-type":"application/json"}
-    payload = {"text": text, "model_id": "eleven_multilingual_v2",
-               "voice_settings": {"stability":0.55,"similarity_boost":0.75,"style":0.25,"use_speaker_boost":True}}
-    r = _with_retries(lambda: requests.post(url, headers=headers, json=payload, timeout=180))
-    if r.status_code >= 400:
-        raise RuntimeError(f"ELEVENLABS_ERROR {r.status_code}: {r.text[:400]}")
-    return r.content
-
-def openai_tts_bytes(text: str, voice_name: str) -> bytes:
-    # OpenAI Python SDK v1.x
-    client = openai_client()
-    try:
-        resp = client.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice=voice_name,
-            input=text,
-            format="mp3"
-        )
-        return resp.read()
-    except Exception as e:
-        # Fallback to streaming API if needed
-        with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts", voice=voice_name, input=text, format="mp3"
-        ) as stream:
-            return stream.read()
-
-def tts_to_file(text: str, voice_id: Optional[str]) -> Tuple[str, str]:
+def llm_bullets_and_script(queries: List[str], sources: List[Dict], language: str, tone: str, target_words: int) -> Tuple[str, List[str]]:
     """
-    Returns (path, provider_used). provider_used: 'elevenlabs' or 'openai'
+    Return (script_text, bullets[]) based on sources; tight / factual style.
     """
-    # Explicit OpenAI voice (e.g., "openai:alloy")
-    if voice_id and voice_id.startswith("openai:"):
-        voice = voice_id.split(":",1)[1].strip() or OPENAI_TTS_VOICE
-        data = openai_tts_bytes(text, voice)
-        name = f"noah_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-        path = os.path.join(DATA_DIR, name)
-        with open(path,"wb") as f: f.write(data)
-        return path, "openai"
+    client = get_openai_client()
+    # Keep prompt concise to speed up; ask for topical, fact-first style
+    sys = (
+        "You are Noah, a news editor. Create a concise, factual spoken script from these recent sources. "
+        "Always lead with the newest items. Use short sentences, minimal filler. "
+        "Write in {language}, tone {tone}. Target ~{words} words total."
+    ).format(language=language, tone=tone, words=target_words)
 
-    # Respect forced provider via env
-    force_openai = NOAH_TTS_PROVIDER == "openai"
-    force_eleven = NOAH_TTS_PROVIDER == "elevenlabs"
-
-    # Try ElevenLabs first (default/auto) unless forced OpenAI
-    if not force_openai:
-        vid = _resolve_eleven_voice(None if (voice_id and voice_id.startswith("openai:")) else voice_id)
-        if vid:
-            try:
-                data = eleven_tts_bytes(text, vid)
-                name = f"noah_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-                path = os.path.join(DATA_DIR, name)
-                with open(path,"wb") as f: f.write(data)
-                return path, "elevenlabs"
-            except Exception as e:
-                msg = str(e).lower()
-                # Auto-fallback on quota/401 or generic ELEVENLABS_ERROR
-                if ("quota" in msg) or ("401" in msg) or ("elevenlabs_error" in msg):
-                    pass
-                else:
-                    raise
-
-    # Fallback: OpenAI TTS
-    voice = OPENAI_TTS_VOICE
-    data = openai_tts_bytes(text, voice)
-    name = f"noah_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-    path = os.path.join(DATA_DIR, name)
-    with open(path,"wb") as f: f.write(data)
-    return path, "openai"
-
-def audio_duration(path: str) -> float:
-    return float(len(AudioSegment.from_file(path)) / 1000.0)
-
-def exactify_with_atempo(path: str, target_seconds: int) -> Tuple[str,float]:
-    actual = audio_duration(path)
-    if actual <= 0 or target_seconds <= 0: return path, 1.0
-    desired = actual / float(target_seconds)
-    rate = clamp(desired, MIN_ATEMPO, MAX_ATEMPO)
-    if abs(rate - 1.0) < 0.02: return path, 1.0
-    out = path.replace(".mp3","_exact.mp3")
-    cmd = f'ffmpeg -y -i "{path}" -filter:a "atempo={rate:.6f}" -vn "{out}"'
-    code = os.system(cmd)
-    if code != 0 or not os.path.exists(out): return path, 1.0
-    return out, rate
-
-# --------- WPS calibration (cached / fast) ---------
-def _load_wps_cache() -> Dict[str, Any]:
-    if not os.path.exists(WPS_CACHE_PATH): return {}
-    try:
-        with open(WPS_CACHE_PATH,"r") as f: return json.load(f)
-    except Exception:
-        return {}
-
-def _save_wps_cache(cache: Dict[str, Any]) -> None:
-    try:
-        with open(WPS_CACHE_PATH,"w") as f: json.dump(cache, f)
-    except Exception:
-        pass
-
-def _calib_text(language: str, words=100) -> str:
-    base = "This sample measures typical narration speed for news style delivery."
-    return " ".join([base]*max(1, int(words / max(1, word_count(base)))))
-
-def calibrate_wps(voice_id: Optional[str], language: str, progress=None) -> float:
-    cache = _load_wps_cache()
-    key = f"{language}::{voice_id or 'auto'}::{OPENAI_TTS_VOICE}::{NOAH_TTS_PROVIDER}"
-    rec = cache.get(key)
-    now = time.time()
-    if rec and (now - rec.get("ts", 0)) < (WPS_CACHE_TTL_DAYS * 86400):
-        if progress: progress("calibration_cache_hit")
-        return float(rec.get("wps", DEFAULT_WPS))
-
-    if progress: progress("calibrating_voice")
-    try:
-        text = _calib_text(language, 100)
-        tmp, _provider = tts_to_file(text, voice_id)
-        dur = audio_duration(tmp); wc = word_count(text)
-        wps = clamp(wc / max(1.0, dur), 1.6, 3.6)
-        cache[key] = {"wps": wps, "ts": now}
-        _save_wps_cache(cache)
-        return float(wps)
-    except Exception:
-        if progress: progress("calibration_failed")
-        return float(LANG_WPS.get(language, DEFAULT_WPS))
-
-# --------- Targeting & OpenAI prompts ---------
-def compute_targets(minutes: int, wps: float, intro: str, outro: str, n_stories: int) -> Dict[str,int]:
-    total_secs = max(1, minutes * 60)
-    total_words = int(total_secs * wps)
-    intro_w, outro_w = word_count(intro), word_count(outro)
-    body_words = max(60, total_words - intro_w - outro_w)
-    per_story = max(40, int(body_words / max(6, n_stories)))
-    return {"total": total_words, "min": int(total_words*0.99), "max": int(total_words*1.01), "per_story": per_story}
-
-def _message_text(msg):
-    if msg is None: return ""
-    parsed = getattr(msg, "parsed", None)
-    if isinstance(parsed, dict):
-        try: return json.dumps(parsed)
-        except Exception: pass
-    content = getattr(msg, "content", None)
-    if isinstance(content, str): return content
-    if isinstance(content, list):
-        return "".join([(p.get("text","") if isinstance(p,dict) else str(p)) for p in content])
-    if isinstance(content, dict):
-        try: return json.dumps(content)
-        except Exception: return str(content)
-    return str(content or "")
-
-def _message_json(msg):
-    parsed = getattr(msg, "parsed", None)
-    if isinstance(parsed, dict): return parsed
-    try: return json.loads((_message_text(msg) or "").strip())
-    except Exception: return {}
-
-def _chat_json(client, messages, temp=0.25):
-    tries, last = 3, {}
-    for i in range(tries):
-        r = client.chat.completions.create(model="gpt-4o-mini", temperature=temp,
-                                           response_format={"type":"json_object"},
-                                           messages=messages, timeout=60)
-        js = _message_json(r.choices[0].message)
-        if js: return js
-        time.sleep(1.2*(i+1)); last = js
-    return last
-
-def _chat_text(client, messages, temp=0.2):
-    tries, last = 3, ""
-    for i in range(tries):
-        r = client.chat.completions.create(model="gpt-4o-mini", temperature=temp,
-                                           messages=messages, timeout=60)
-        txt = (_message_text(r.choices[0].message) or "").strip()
-        if txt: return txt
-        time.sleep(1.2*(i+1)); last = txt
-    return last
-
-def build_messages(language, tone, queries, sources, targets, intro, outro):
     src_lines = []
-    for q, items in sources.items():
-        src_lines.append(f"Topic: {q}")
-        for it in items:
-            src_lines.append(f"- {it.get('title','')} ({it.get('source','')}) <{it.get('link','')}>")
-    src_text = "\n".join(src_lines[:220])
-    n = max(6, sum(len(v) for v in sources.values()))
-    per_story = targets["per_story"]
+    for s in sources[:24]:  # cap context to keep latency sensible
+        src_lines.append(f"- {s['title']} ({s['link']})")
+    src_block = "\n".join(src_lines) or "(no sources)"
 
-    system = (
-        "You are Noah, a concise, factual news editor.\n"
-        "Return JSON with keys 'bullets' and 'narration'.\n"
-        f"- The final 'narration' MUST be between {targets['min']} and {targets['max']} words (target≈{targets['total']}).\n"
-        "- Use only the provided sources. No filler; keep it topical and recent.\n"
-        "- Sentences short and crisp. Start EXACTLY with the intro and end EXACTLY with the outro.\n"
+    user = (
+        f"Topics: {', '.join(queries)}\n"
+        f"Sources (latest first):\n{src_block}\n\n"
+        "Return JSON with keys:\n"
+        "- bullets: a list of 6-12 compact bullet points (strings)\n"
+        "- script: a single-paragraph broadcast script (no headings)"
+    )
+
+    resp = client.chat.completions.create(
+        model=os.getenv("NOAH_SUMMARY_MODEL","gpt-4o-mini"),
+        messages=[
+            {"role":"system","content":sys},
+            {"role":"user","content":user}
+        ],
+        temperature=0.2,
+        response_format={"type":"json_object"}
+    )
+    content = resp.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except Exception:
+        data = {"bullets": [], "script": content}
+
+    bullets = [b for b in data.get("bullets", []) if isinstance(b, str)]
+    script = data.get("script", "")
+    # safety: if no script, build from bullets
+    if not script.strip():
+        script = " ".join(bullets)
+    return script.strip(), bullets
+
+def llm_expand_or_shrink(text: str, desired_words: int, language: str, tone: str) -> str:
+    """Correct length toward desired_words. Keep topical, concise style."""
+    client = get_openai_client()
+    sys = (
+        "You are a broadcast editor. Adjust the script length to match the requested word count "
+        "while preserving key facts and concise style. Avoid filler; keep it newsy and current."
     )
     user = (
-        f"Language: {language}\nTone: {tone}\n\n"
-        f"Intro: {intro}\nOutro: {outro}\n\n"
-        "Queries:\n" + "\n".join([f"- {q}" for q in queries]) + "\n\n"
-        "Sources to rely on:\n" + src_text + "\n\n"
-        f"Make an outline of about {n} micro-stories (each ~{per_story} words), then produce:\n"
-        "1) 'bullets': compact markdown bullets of the headlines you cover;\n"
-        "2) 'narration': the full narration including the intro and outro.\n\n"
-        "Return STRICT JSON only (no code fences):\n"
-        "{\n  \"bullets\":\"markdown bullets\",\n  \"narration\":\"full narration including intro & outro\"\n}\n"
+        f"Language: {language}\nTone: {tone}\n"
+        f"Target words: {desired_words}\n"
+        f"Script:\n{text}\n\n"
+        "Return only the revised script."
     )
-    return [{"role":"system","content":system},{"role":"user","content":user}]
-
-def refine_length(client, narration, language, tone, targets, direction):
-    msgs = [
-        {"role":"system","content":"You precisely fit strict word targets without changing meaning."},
-        {"role":"user","content":
-            f"{direction} the narration to {targets['total']} words "
-            f"(must be {targets['min']}–{targets['max']}). "
-            f"Language={language}; tone={tone}. Keep ONLY fresh facts from the supplied sources; no background. "
-            "Return ONLY the revised narration text.\n\n"
-            "Narration:\n"+narration}
-    ]
-    return _chat_text(openai_client(), msgs, temp=0.2)
-
-def generate_text(queries, language, tone, sources, minutes, wps, progress=None):
-    intro = INTRO.get(language, INTRO["English"])
-    outro = OUTRO.get(language, OUTRO["English"])
-    n_stories = max(6, sum(len(v) for v in sources.values()))
-    targets = compute_targets(minutes, wps, intro, outro, n_stories)
-
-    client = openai_client()
-    attempts, corrections_total = 0, 0
-    bullets, narration = "", ""
-
-    while attempts < 3:
-        attempts += 1
-        if progress: progress(f"draft_attempt_{attempts}")
-        msgs = build_messages(language, tone, queries, sources, targets, intro, outro)
-        js = _chat_json(client, msgs, temp=0.25)
-        bullets = str(js.get("bullets","")).strip()
-        narration = str(js.get("narration","")).strip()
-
-        for _ in range(6):  # up to 6 corrections
-            wc = word_count(narration)
-            if targets["min"] <= wc <= targets["max"]:
-                return bullets, narration, wc, corrections_total, attempts
-            direction = "Expand" if wc < targets["min"] else "Tighten"
-            if progress: progress(f"correct_{direction.lower()}_{wc}")
-            narration = refine_length(client, narration, language, tone, targets, direction)
-            corrections_total += 1
-
-        targets["min"] = int(targets["total"] * 0.985)
-        targets["max"] = int(targets["total"] * 1.015)
-
-    wc = word_count(narration)
-    if wc > targets["max"]:
-        narration = " ".join(narration.split()[:targets["max"]])
-    elif wc < targets["min"]:
-        narration += "\n(Additional headlines omitted for time.)"
-    return bullets, narration, word_count(narration), corrections_total, attempts
-
-def make_noah_audio(
-    queries: List[str], language: str, tone: str, recent_hours: int,
-    per_feed: int, cap_per_query: int, minutes_target: int,
-    exact_minutes: bool = True, voice_id: Optional[str] = None,
-    progress: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
-
-    if progress: progress("collecting_sources")
-    sources = collect_sources(queries, recent_hours, cap_per_query)
-
-    wps = calibrate_wps(voice_id, language, progress=progress)
-
-    bullets, narration, wc, corr, attempts = generate_text(
-        queries, language, tone, sources, minutes_target, wps, progress=progress
+    resp = client.chat.completions.create(
+        model=os.getenv("NOAH_EDITOR_MODEL","gpt-4o-mini"),
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0.2
     )
+    return resp.choices[0].message.content.strip()
 
-    if progress: progress("tts_start")
-    mp3_path, provider_used = tts_to_file(narration, voice_id)
-    dur = audio_duration(mp3_path)
-    applied = 1.0
+# --------------------------
+# TTS providers
+# --------------------------
+def tts_openai(text: str, out_path: str, voice: Optional[str] = None) -> str:
+    """
+    OpenAI TTS (robust across SDK versions):
+      1) Try streaming API (no 'format' kwarg).
+      2) Fallback to non-streaming with response_format='mp3' if needed.
+    Returns absolute mp3 path.
+    """
+    out_path = str(out_path)
+    Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
 
-    if exact_minutes:
-        if progress: progress("exactify_audio")
-        target = max(1, minutes_target * 60)
-        new_path, applied = exactify_with_atempo(mp3_path, target)
-        if new_path != mp3_path:
-            mp3_path = new_path
-            dur = audio_duration(mp3_path)
+    client = get_openai_client()
+    model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    v = voice or os.getenv("OPENAI_TTS_VOICE", "alloy")
 
-    if progress: progress("done")
+    try:
+        # Preferred: streaming
+        with client.audio.speech.with_streaming_response.create(
+            model=model, voice=v, input=text
+        ) as resp:
+            resp.stream_to_file(out_path)
+        return os.path.abspath(out_path)
+    except Exception:
+        traceback.print_exc()
 
-    return {
-        "bullet_points": bullets,
-        "script": narration,
-        "sources": sources,
-        "file_path": mp3_path,
-        "duration_seconds": dur,
-        "minutes_target": minutes_target,
-        "playback_rate_applied": applied,
-        "tts_provider": provider_used,
-        "generated_at": now_iso(),
-        "calibrated_wps": wps,
-        "narration_word_count": wc,
-        "correction_passes": corr,
-        "attempts": attempts,
+    # Fallback: non-streaming
+    try:
+        result = client.audio.speech.create(
+            model=model, voice=v, input=text, response_format="mp3"
+        )
+        if hasattr(result, "read"):
+            audio_bytes = result.read()
+        elif hasattr(result, "content"):
+            audio_bytes = result.content
+        else:
+            audio_bytes = bytes(result)
+        with open(out_path, "wb") as f:
+            f.write(audio_bytes)
+        return os.path.abspath(out_path)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+def tts_elevenlabs(text: str, out_path: str, voice_id: Optional[str] = None) -> str:
+    """
+    ElevenLabs TTS (streaming). Raises if quota/rate-limited.
+    """
+    key = os.getenv("ELEVENLABS_API_KEY","").strip()
+    if not key:
+        raise RuntimeError("ELEVENLABS_API_KEY missing")
+
+    vid = voice_id or os.getenv("ELEVENLABS_VOICE_ID","")
+    if not vid:
+        # default voice
+        vid = "21m00Tcm4TlvDq8ikWAM"  # Rachel (public) – safe default; replace if you like
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream?optimize_streaming_latency=3"
+    headers = {
+        "xi-api-key": key,
+        "accept": "audio/mpeg",
+        "content-type": "application/json"
     }
+    payload = {
+        "text": text,
+        "voice_settings": {"stability": 0.4, "similarity_boost": 0.7}
+    }
+
+    Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
+    with requests.post(url, headers=headers, data=json.dumps(payload), stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+    return os.path.abspath(out_path)
+
+# --------------------------
+# Audio exactify
+# --------------------------
+def audio_duration_seconds(path: str) -> float:
+    au = AudioSegment.from_file(path)
+    return au.duration_seconds
+
+def atempo_exactify(in_mp3: str, target_minutes: float) -> Tuple[str, float, float]:
+    """
+    Adjust playback rate (ffmpeg atempo) within bounds to match target minutes.
+    Returns (new_path, new_secs, rate_applied).
+    """
+    target_secs = target_minutes * 60.0
+    cur = audio_duration_seconds(in_mp3)
+    if cur <= 0:
+        return in_mp3, 0.0, 1.0
+
+    rate = clamp(target_secs / cur, ATEMPO_MIN, ATEMPO_MAX)
+    if abs(rate - 1.0) < 0.01:
+        return in_mp3, cur, 1.0
+
+    # pydub speedup changes pitch a bit; for demo use it's ok and fast.
+    au = AudioSegment.from_file(in_mp3)
+    # pydub's speedup is multiplier on playback speed
+    new = speedup(au, playback_speed=rate)
+    out = str(Path(in_mp3).with_suffix(".exact.mp3"))
+    new.export(out, format="mp3")
+    new_secs = audio_duration_seconds(out)
+    return out, new_secs, rate
+
+# --------------------------
+# Main pipeline
+# --------------------------
+def make_noah_audio(
+    queries_raw: object,
+    language: str = "English",
+    tone: str = "confident and crisp",
+    recent_hours: int = 24,
+    cap_per_query: int = 6,
+    min_minutes: float = 8.0,
+    exact_minutes: bool = True,
+    voice_id: Optional[str] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    """
+    Returns dict:
+      {
+        "script": "...",
+        "bullets": [...],
+        "sources": [...],
+        "mp3_path": "/tmp/noah_jobs/....mp3",
+        "actual_minutes": 7.95,
+        "target_minutes": 8.0,
+        "playback_rate": 0.99,
+        "tts_provider": "openai" | "elevenlabs"
+      }
+    """
+    def tick(msg: str):
+        if on_progress: on_progress(msg)
+
+    queries = sanitize_queries(queries_raw)
+    if not queries:
+        raise ValueError("No topics provided")
+
+    # 1) Sources
+    tick("Collecting sources")
+    sources = fetch_sources(queries, recent_hours, cap_per_query=cap_per_query)
+    if not sources:
+        # Still proceed: model can provide overview
+        tick("No sources found; falling back to background context")
+
+    # 2) Draft (words near target)
+    target_words = minutes_to_words(min_minutes)
+    tick("Draft Attempt 1")
+    script, bullets = llm_bullets_and_script(queries, sources, language, tone, target_words)
+
+    # 3) Correct toward exact words (bounded passes)
+    for i in range(EXACTIFY_MAX_PASSES):
+        word_count = len(re.findall(r"\w+", script))
+        if abs(word_count - target_words) / target_words <= 0.05:
+            break
+        tick(f"Correct Expand {word_count}")
+        script = llm_expand_or_shrink(script, target_words, language, tone)
+
+    # 4) TTS (provider selection)
+    provider = (os.getenv("NOAH_TTS_PROVIDER", "openai") or "openai").lower()
+    # auto mode tries 11labs first if key is present
+    if provider == "auto":
+        provider = "elevenlabs" if os.getenv("ELEVENLABS_API_KEY","").strip() else "openai"
+
+    mp3_path = str(DATA_DIR / f"noah_{int(time.time())}_{random.randint(1000,9999)}.mp3")
+    tick("TTS Start")
+    if provider == "elevenlabs":
+        try:
+            tts_elevenlabs(script, mp3_path, voice_id=voice_id or os.getenv("ELEVENLABS_VOICE_ID",""))
+            tts_used = "elevenlabs"
+        except Exception:
+            traceback.print_exc()
+            tick("11Labs failed; falling back to OpenAI TTS")
+            tts_openai(script, mp3_path, voice=os.getenv("OPENAI_TTS_VOICE","alloy"))
+            tts_used = "openai"
+    else:
+        tts_openai(script, mp3_path, voice=os.getenv("OPENAI_TTS_VOICE","alloy"))
+        tts_used = "openai"
+
+    # 5) Exactify duration
+    tick("Exactify audio")
+    out_path, new_secs, rate = atempo_exactify(mp3_path, min_minutes if exact_minutes else (len(script.split())/WPM_DEFAULT/60))
+    if out_path != mp3_path:
+        try: os.remove(mp3_path)
+        except: pass
+        mp3_path = out_path
+
+    result = {
+        "script": script,
+        "bullets": bullets,
+        "sources": sources,
+        "mp3_path": mp3_path,
+        "actual_minutes": round(new_secs/60.0, 2),
+        "target_minutes": float(min_minutes),
+        "playback_rate": round(rate, 3),
+        "tts_provider": tts_used,
+    }
+    return result

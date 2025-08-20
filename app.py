@@ -1,133 +1,185 @@
-# app.py — Streamlit UI (polling + live progress + show TTS provider)
-import os, time, requests, streamlit as st
+# app.py (Streamlit UI)
+import os, time, requests, json, math
+from typing import List, Dict
+from pathlib import Path
+import streamlit as st
 
-API_BASE = os.getenv("API_BASE", "https://thenoah.onrender.com")
-MAX_WAIT_SECONDS = int(os.getenv("NOAH_MAX_CLIENT_WAIT", "900"))  # 15 minutes
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8080")
+MAX_WAIT = int(os.getenv("NOAH_MAX_CLIENT_WAIT", "900"))  # seconds
 
-st.set_page_config(page_title="Noah — Daily Smart Bulletins", page_icon="🗞️", layout="wide")
+st.set_page_config(
+    page_title="Zem Labs • Noah",
+    page_icon="🎧",
+    layout="wide",
+)
 
+# ---------------- UI theming tweaks ----------------
 st.markdown("""
 <style>
-:root { --ink:#E8EDF7; --muted:#9AA6B2; --panel:#0F172A; --border:#1F2A44; }
-.small-muted {color:var(--muted);font-size:0.85rem;}
-.card {background:var(--panel);border-radius:14px;padding:18px;border:1px solid var(--border);}
-h1,h2,h3 {color:var(--ink)}
-.stAudio { margin-top: 10px; }
+/* Make labels visible/high-contrast */
+.stSelectbox label, .stTextArea label, .stSlider label, .stCheckbox label {
+  font-weight: 600 !important; color: #e9eef7 !important;
+}
+.block-container { padding-top: 1.2rem; }
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------- Helper calls ----------------
+def api_get_voices() -> List[Dict]:
+    try:
+        r = requests.get(f"{API_BASE}/voices", timeout=30)
+        r.raise_for_status()
+        return r.json().get("voices", [])
+    except Exception:
+        return [{"provider":"openai","id":"alloy","name":"alloy"}]
+
+def call_api_generate(payload: Dict) -> str:
+    r = requests.post(f"{API_BASE}/generate", json=payload, timeout=600)
+    r.raise_for_status()
+    return r.json()["job_id"]
+
+def poll_result(job_id: str, wait_s: int = MAX_WAIT) -> Dict:
+    t0 = time.time()
+    while True:
+        r = requests.get(f"{API_BASE}/result/{job_id}", timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") in ("done","error"):
+            return data
+        if time.time() - t0 > wait_s:
+            return {"status":"timeout","job_id":job_id}
+        time.sleep(2)
+
+# Keep state so results don't disappear on rerun
+if "last" not in st.session_state:
+    st.session_state.last = None
+
+# ---------------- Sidebar controls ----------------
 with st.sidebar:
     st.header("Language")
-    lang = st.selectbox("Language", ["English"], index=0)
+    language = st.selectbox("Language", ["English","French","German","Spanish","Arabic"], index=0)
 
     st.header("Voice")
-    voice_opts = ["Use API default"]
-    try:
-        r = requests.get(f"{API_BASE}/voices", timeout=10)
-        if r.ok:
-            for v in r.json():
-                voice_opts.append(f"{v['name']} — {v['id']}")
-    except Exception:
-        pass
-    sel_voice = st.selectbox("Voice", voice_opts, index=0)
-    voice_id = sel_voice.split("—")[-1].strip() if "—" in sel_voice else ""
+    voices = api_get_voices()
+    voice_options = ["Use API default"] + [f"{v['name']} ({v['provider']})" for v in voices]
+    voice_pick = st.selectbox("Voice", voice_options, index=0)
+    chosen_voice_id = ""
+    chosen_voice_provider = ""
+    if voice_pick != "Use API default":
+        vi = voices[voice_options.index(voice_pick)-1]
+        # Only pass ElevenLabs voice_id to API; OpenAI voices selected via env on API
+        if vi["provider"] == "elevenlabs":
+            chosen_voice_id = vi["id"]
+            chosen_voice_provider = "elevenlabs"
 
     st.header("Topics / queries (one per line)")
-    topics = st.text_area("Topics", height=140, label_visibility="collapsed", placeholder="world news\nAI research")
+    topics = st.text_area("Topics", value="world news\nAI research", height=140)
 
     st.header("Exact length (minutes)")
-    minutes = st.slider("Exact minutes", 2, 30, 8, 1)
+    exact_minutes = st.slider("Exact minutes", min_value=2, max_value=30, value=8, step=1)
 
     st.header("Tone")
-    tone = st.selectbox("Tone", ["confident and crisp","calm and neutral","warm and friendly","fast and energetic"], index=0)
+    tone = st.selectbox("Tone", ["confident and crisp", "warm and friendly", "neutral", "urgent"])
 
     st.header("How far back to look (hours)")
-    lookback = st.slider("Lookback", 6, 72, 24, 1)
+    lookback = st.slider("Lookback", min_value=6, max_value=72, value=24, step=6)
 
     st.header("Maximum stories per topic")
-    cap = st.slider("Cap per topic", 2, 8, 6, 1)
+    cap_per = st.slider("Cap per topic", min_value=2, max_value=8, value=6, step=1)
 
-    strict = st.toggle("Strict timing (playback adjusted to exact length)", value=True)
+    strict = st.checkbox("Strict timing (playback adjusted to exact length)", value=True)
 
-    go = st.button("🚀 Generate Noah", use_container_width=True)
+    run = st.button("🚀 Generate Noah", use_container_width=True)
 
+# ---------------- Main column ----------------
 st.title("Noah — Daily Smart Bulletins")
 st.caption("Generated news & insights in your language, your voice, your time.")
+st.markdown(f"""
+<span style="float:right; font-size: 12px; opacity:0.65;">API: <code>{API_BASE}</code></span>
+""", unsafe_allow_html=True)
+st.divider()
 
-if "last" not in st.session_state: st.session_state.last = None
+status = st.empty()
+colL, colR = st.columns([1,1.2], gap="large")
 
-def call_with_retry(method, url, **kw):
-    for i in range(5):
-        try:
-            r = requests.request(method, url, timeout=30, **kw)
-            if r.status_code in (502,503,504):
-                time.sleep(1.5*(i+1)); continue
-            return r
-        except requests.exceptions.RequestException:
-            time.sleep(1.5*(i+1))
-    raise RuntimeError(f"Failed to reach {url}")
-
-if go:
-    queries = [q.strip() for q in topics.splitlines() if q.strip()]
-    payload = {
-        "queries": queries,
-        "language": lang,
-        "tone": tone,
-        "recent_hours": lookback,
-        "per_feed": 4,
-        "cap_per_query": cap,
-        "min_minutes": minutes,
-        "exact_minutes": bool(strict),
-        "voice_id": voice_id or None,
-    }
-    with st.status("Contacting Noah API…", state="running", expanded=True) as stat:
-        try:
-            r = call_with_retry("POST", f"{API_BASE}/generate", json=payload)
-            if not r.ok:
-                st.error(f"API {r.status_code}: {r.text[:400]}")
-            else:
-                job_id = r.json().get("job_id")
-                st.write(f"Started job: `{job_id}`")
-
-                start = time.time(); res = None; last_stage = ""
-                while True:
-                    time.sleep(2.0)
-                    rr = call_with_retry("GET", f"{API_BASE}/result/{job_id}")
-                    js = rr.json()
-                    if js.get("status") == "done":
-                        res = js.get("result"); break
-                    if js.get("status") == "error":
-                        st.error(f"API job failed: {js.get('error','unknown error')[:400]}"); break
-                    stage = js.get("progress","")
-                    if stage and stage != last_stage:
-                        st.write(f"• {stage.replace('_',' ').title()}"); last_stage = stage
-                    if time.time() - start > MAX_WAIT_SECONDS:
-                        st.error("Timeout waiting for API result."); break
-                if res:
-                    st.success(f"Received in {time.time()-start:.1f}s")
-                    st.session_state.last = res
-        except Exception as e:
-            st.error(f"Client error: {e}")
-
-res = st.session_state.last
-if res:
-    col1, col2 = st.columns([1,1])
-    with col1:
+def render_result(res: Dict):
+    with colL:
         st.subheader("Bullet points")
-        st.markdown(res.get("bullet_points") or "-")
-    with col2:
-        st.subheader("Your briefing")
-        provider = res.get("tts_provider","")
-        note = f" • Voice: {provider}" if provider else ""
-        target_m = res.get("minutes_target", 0)
-        actual_s = float(res.get("duration_seconds", 0))
-        st.caption(f"Target: {target_m} min • Actual: {actual_s/60:.1f} min • Playback: {res.get('playback_rate_applied',1.0):.2f}x{note}")
-        st.audio(f"{API_BASE}{res['mp3_url']}")
-        audio = call_with_retry("GET", f"{API_BASE}{res['mp3_url']}").content
-        st.download_button("⬇️ Download MP3", data=audio, file_name="noah.mp3", mime="audio/mpeg", use_container_width=True)
+        b = res["result"].get("bullets", [])
+        if b:
+            st.markdown("\n".join([f"- {x}" for x in b]))
+        else:
+            st.info("No bullets returned.")
 
-    with st.expander("Sources used"):
-        for topic, items in (res.get("sources") or {}).items():
-            st.markdown(f"**{topic}**")
-            for it in items:
-                st.markdown(f"- {it.get('title','')} — *{it.get('source','')}* — [link]({it.get('link','#')})")
+        with st.expander("Sources used", expanded=True):
+            srcs = res["result"].get("sources", [])
+            if not srcs:
+                st.write("No sources available.")
+            else:
+                by_topic: Dict[str, List[Dict]] = {}
+                for s in srcs:
+                    by_topic.setdefault(s.get("query","(topic)"), []).append(s)
+                for t, arr in by_topic.items():
+                    st.write(f"**{t}**")
+                    for s in arr[:10]:
+                        title = s.get("title","(title)")
+                        link = s.get("link","#")
+                        st.markdown(f"- {title} — [link]({link})")
+
+    with colR:
+        st.subheader("Your briefing")
+        mp3_url = res["result"].get("mp3_url")
+        if mp3_url:
+            st.audio(f"{API_BASE}{mp3_url}", format="audio/mp3")
+            meta = res["result"]
+            st.caption(
+                f"Target: {meta.get('target_minutes')} min • "
+                f"Actual: {meta.get('actual_minutes')} min • "
+                f"Playback: {meta.get('playback_rate')}x • "
+                f"Voice: {meta.get('tts_provider')}"
+            )
+            st.download_button("Download MP3", data=requests.get(f"{API_BASE}{mp3_url}", timeout=60).content,
+                               file_name="noah.mp3", mime="audio/mpeg")
+        else:
+            st.error("No audio produced.")
+
+# ---------------- Action ----------------
+if run:
+    st.session_state.last = None
+    payload = {
+        "queries": topics,
+        "language": language,
+        "tone": tone,
+        "recent_hours": int(lookback),
+        "cap_per_query": int(cap_per),
+        "min_minutes": float(exact_minutes),
+        "exact_minutes": bool(strict),
+    }
+    if chosen_voice_id and chosen_voice_provider == "elevenlabs":
+        payload["voice_id"] = chosen_voice_id
+
+    with status.container():
+        with st.status("Contacting Noah API…", expanded=True) as s:
+            try:
+                job_id = call_api_generate(payload)
+                st.write(f"Started job: `{job_id}`")
+                # poll
+                res = poll_result(job_id)
+                if res.get("status") == "done":
+                    s.update(label="Done ✓", state="complete")
+                    st.session_state.last = res
+                elif res.get("status") == "timeout":
+                    s.update(label="Timeout waiting for API result.", state="error")
+                else:
+                    s.update(label=f"Failed ✗\n\n{res.get('error','(no details)')}", state="error")
+            except requests.HTTPError as e:
+                s.update(label=f"API {e.response.status_code}: {e.response.text[:500]}", state="error")
+            except Exception as e:
+                s.update(label=f"Error: {e}", state="error")
+
+# Persist last result on screen
+if st.session_state.last:
+    render_result(st.session_state.last)
+else:
+    with st.container():
+        st.info("Enter topics on the left and click **Generate Noah** to try the beta.")

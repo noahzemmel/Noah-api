@@ -1,9 +1,10 @@
-# server.py — Noah API with async jobs and /result/{job_id}
+# server.py — Noah API with async jobs and provider-aware /voices
 from __future__ import annotations
 import os, uuid, time, threading, traceback
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -51,7 +52,6 @@ def cleanup_jobs():
 
 # ------------------- Helpers -------------------
 def file_url(request: Request, filename: str) -> str:
-    # Prefer PUBLIC_BASE_URL if you set it on Render; otherwise build from the request
     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     if not base:
         base = str(request.base_url).rstrip("/")
@@ -75,31 +75,46 @@ def health():
 @app.get("/voices")
 def voices():
     """
-    Return a minimal list of voices for the UI dropdown.
-    If you want to list ElevenLabs voices dynamically, you can extend this later.
+    Return a provider-aware list of voices.
+    Always contains:
+      - Use API default (provider=auto, id="")
+      - Alloy (OpenAI) (provider=openai, id="alloy")
+    If ELEVENLABS_API_KEY is configured, we fetch ElevenLabs voices
+    and include up to 15 for the dropdown.
     """
-    # Static minimal set; “Use API default” means let TTS provider pick.
     items = [
-        {"id": "", "name": "Use API default"},
-        {"id": "alloy", "name": "Alloy (OpenAI)"},
+        {"id": "", "name": "Use API default", "provider": "auto"},
+        {"id": "alloy", "name": "Alloy", "provider": "openai"},
     ]
-    # If an ELEVENLABS_VOICE_ID is present, expose it as a choice
-    v11 = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
-    if v11:
-        items.append({"id": v11, "name": "ElevenLabs default"})
+
+    xi = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if xi:
+        try:
+            r = requests.get(
+                "https://api.elevenlabs.io/v1/voices",
+                headers={"xi-api-key": xi},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for v in (data.get("voices") or [])[:15]:
+                items.append({
+                    "id": v.get("voice_id", ""),
+                    "name": v.get("name", "Voice"),
+                    "provider": "elevenlabs",
+                })
+        except Exception as e:
+            # Don't fail the UI if ElevenLabs listing fails
+            print("WARN: could not list ElevenLabs voices:", e)
+
     return {"voices": items}
 
 @app.post("/generate")
 def generate(payload: dict = Body(...)):
-    """
-    Kick off a generation job. Returns a job_id immediately.
-    The worker thread writes progress logs and final result into JOBS[job_id].
-    """
     cleanup_jobs()
     job_id = uuid.uuid4().hex
     set_job(job_id, status="queued", logs=[], error=None)
 
-    # Normalize/validate payload fields the core expects
     queries_raw   = payload.get("queries", "")
     language      = payload.get("language", "English")
     tone          = payload.get("tone", "confident and crisp")
@@ -115,7 +130,7 @@ def generate(payload: dict = Body(...)):
     def worker():
         try:
             set_job(job_id, status="running")
-            add_log(job_id, "Calibrating voice")
+            add_log(job_id, "Calibrating Voice")
             result = make_noah_audio(
                 queries_raw=queries_raw,
                 language=language,
@@ -127,7 +142,6 @@ def generate(payload: dict = Body(...)):
                 voice_id=voice_id,
                 on_progress=on_progress,
             )
-            # Build a download URL
             mp3_path = result.get("mp3_path", "")
             filename = Path(mp3_path).name if mp3_path else ""
             set_job(job_id, status="done", result={
@@ -160,7 +174,6 @@ def job_result(job_id: str, request: Request):
         out["error"] = job["error"]
     if job.get("result"):
         res = dict(job["result"])
-        # upgrade relative mp3_url to absolute for the browser
         if res.get("mp3_url", "").startswith("/download/"):
             res["mp3_url"] = file_url(request, res["mp3_name"])
         out["result"] = res
@@ -173,7 +186,6 @@ def download(name: str):
         return JSONResponse({"error": "file not found"}, status_code=404)
     return FileResponse(str(p), media_type="audio/mpeg", filename=name)
 
-# ------------- Uvicorn entrypoint -------------
 def _port() -> int:
     try:
         return int(os.getenv("PORT", "10000"))

@@ -1,396 +1,409 @@
-# noah_core.py — exact-length, multi-topic, fresh-news generator
-from __future__ import annotations
-import os, io, re, math, time, uuid, json, random
-from typing import List, Dict, Any, Tuple, Optional, Callable
-from datetime import datetime, timedelta
-from pathlib import Path
-
+# noah_core.py
+import os
+import io
+import re
+import math
+import json
+import time
+import base64
+import random
 import requests
-import feedparser
+from typing import List, Dict, Tuple
+from datetime import datetime, timezone, timedelta
+
+from dateutil import parser as dateparse
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
+from openai import OpenAI
 
-# ------------- Env & constants -------------
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
-ELEVEN_API_KEY      = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVEN_VOICE_ID_DEF = os.getenv("ELEVENLABS_VOICE_ID", "")
-TAVILY_API_KEY      = os.getenv("TAVILY_API_KEY", "")
-DATA_DIR            = Path(os.getenv("DATA_DIR", "/tmp/noah_jobs")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ----------------------------
+# ENV
+# ----------------------------
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+ELEVEN_API_KEY   = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "")  # optional default
+TAVILY_API_KEY   = os.getenv("TAVILY_API_KEY", "")
 
-# Providers flags
-HAS_TAVILY  = bool(TAVILY_API_KEY)
-HAS_ELEVEN  = bool(ELEVEN_API_KEY)
-HAS_OPENAI  = bool(OPENAI_API_KEY)
+oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ------------- Simple helpers -------------
-def slug(s: str) -> str:
-    s = re.sub(r"[^\w\-]+", "-", s.lower()).strip("-")
-    return re.sub(r"-{2,}", "-", s) or "noah"
+# ----------------------------
+# Constants / Tunables
+# ----------------------------
+# 1. Recency
+DEFAULT_LOOKBACK_H = 24               # overwritten by payload
+MAX_RESULTS_PER_TOPIC = 12            # absolute cap across expansions
+BATCH_FETCH = 6                       # items per Tavily call
 
-def now_utc() -> datetime:
-    return datetime.utcnow()
+# 2. Script sizing (empirical)
+# ElevenLabs default voices are ~13.8–15.5 characters / second at normal pitch/rate.
+CHARS_PER_SEC = 14.2
 
-def http_json(url: str, method: str = "GET", **kw) -> Any:
-    r = requests.request(method, url, timeout=30, **kw)
-    r.raise_for_status()
-    if "application/json" in r.headers.get("content-type", ""):
-        return r.json()
-    return r.text
+# 3. Audio timing
+TRIM_HEAD_MS = 180
+TRIM_TAIL_MS = 220
+SILENCE_DB = -38.0
 
-# ------------- Tavily search -------------
-def tavily_search(query: str, hours: int, max_results: int = 8) -> List[Dict[str, str]]:
-    """Fresh web search via Tavily, restricted by recency."""
-    if not HAS_TAVILY:
-        return []
-    recency = max(1, min(72, hours))
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": "basic",
-        "max_results": max_results,
-        "include_answer": False,
-        "include_domains": [],
-        "exclude_domains": [],
-        "days": max(1, math.ceil(recency / 24)),
-    }
-    r = requests.post("https://api.tavily.com/search", json=payload, timeout=45)
-    r.raise_for_status()
-    data = r.json()
+# 4. Time-stretch clamp to avoid artifacts
+STRETCH_MIN = 0.80    # don't slow down more than 1/0.80 ≈ +25%
+STRETCH_MAX = 1.25    # don't speed up more than 25%
+
+ELEVEN_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+def _safe_parse_date(s):
+    try:
+        dt = dateparse.parse(s)
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _normalize_url(u: str) -> str:
+    if not u:
+        return ""
+    u = u.strip()
+    u = re.sub(r"#.*$", "", u)
+    u = re.sub(r"\?.*$", "", u)
+    u = u.replace("http://", "https://")
+    return u
+
+def _dedupe_items(items: List[Dict]) -> List[Dict]:
+    seen = set()
     out = []
-    for item in data.get("results", []):
-        out.append({
-            "title": item.get("title") or item.get("url") or "source",
-            "url": item.get("url") or "",
-            "snippet": item.get("content") or "",
-            "source": "web",
-        })
+    for it in items:
+        key = (it.get("title","").strip().lower(), _normalize_url(it.get("url","")))
+        if key not in seen and it.get("url"):
+            seen.add(key)
+            out.append(it)
     return out
 
-# ------------- RSS fallback -------------
-DEFAULT_FEEDS = [
-    "https://feeds.bbci.co.uk/news/rss.xml",
-    "https://www.aljazeera.com/xml/rss/all.xml",
-    "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=best",
-    "https://www.ft.com/world?format=rss",
-    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "https://www.theguardian.com/world/rss",
-]
-def rss_recent(hours: int, limit: int = 100) -> List[Dict[str, str]]:
-    cutoff = now_utc() - timedelta(hours=hours)
+# ----------------------------
+# Tavily news fetch (recency strict)
+# ----------------------------
+def _tavily_news(query: str, lookback_h: int, limit: int) -> List[Dict]:
+    """
+    Use Tavily's /search in news mode.
+    We try 'time_range' (hXX) first; if provider complains, fall back to 'days'.
+    """
+    if not TAVILY_API_KEY:
+        return []
+    url = "https://api.tavily.com/search"
+    payload_base = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "advanced",
+        "include_answer": False,
+        "include_raw_content": False,
+        "max_results": min(limit, 10),
+        "topic": "news"
+    }
     out = []
-    for url in DEFAULT_FEEDS:
+    # primary attempt – hours window
+    try:
+        p = dict(payload_base)
+        p["time_range"] = f"h{max(1, int(lookback_h))}"
+        r = requests.post(url, json=p, timeout=40)
+        if r.ok:
+            data = r.json()
+            for res in data.get("results", []):
+                out.append({
+                    "title": res.get("title") or "",
+                    "url":   _normalize_url(res.get("url") or ""),
+                    "source": res.get("source") or "",
+                    "published": res.get("published_time") or res.get("published_date") or ""
+                })
+    except Exception:
+        pass
+
+    # fallback – days
+    if not out:
         try:
-            feed = feedparser.parse(url)
-            for e in feed.entries[:50]:
-                # Some RSS entries lack precise dates; include anyway if unsure
-                published = getattr(e, "published_parsed", None)
-                ok_time = True
-                if published:
-                    dt = datetime(*published[:6])
-                    ok_time = (dt >= cutoff)
-                if ok_time:
+            p = dict(payload_base)
+            p["days"] = max(1, int(math.ceil(lookback_h/24)))
+            r = requests.post(url, json=p, timeout=40)
+            if r.ok:
+                data = r.json()
+                for res in data.get("results", []):
                     out.append({
-                        "title": e.get("title", "news"),
-                        "url": e.get("link", ""),
-                        "snippet": e.get("summary", ""),
-                        "source": "rss",
+                        "title": res.get("title") or "",
+                        "url":   _normalize_url(res.get("url") or ""),
+                        "source": res.get("source") or "",
+                        "published": res.get("published_time") or res.get("published_date") or ""
                     })
         except Exception:
             pass
-    random.shuffle(out)
-    return out[:limit]
+    # filter to window strictly
+    cutoff = _now_utc() - timedelta(hours=lookback_h)
+    strict = []
+    for it in out:
+        when = _safe_parse_date(it.get("published") or "")
+        if when and when >= cutoff and it.get("url"):
+            strict.append({**it, "published": when.isoformat()})
+    return _dedupe_items(strict)
 
-# ------------- OpenAI LLM / TTS -------------
-def openai_chat(system: str, user: str, temperature=0.4, tokens=1200) -> str:
-    if not HAS_OPENAI:
-        raise RuntimeError("OPENAI_API_KEY not set")
+# ----------------------------
+# Script building with coverage and size control
+# ----------------------------
+def _allocate_char_budget(total_sec: int, topics_n: int, head_tail_sec=8) -> Tuple[int, int, List[int]]:
+    """
+    Reserve a small fixed intro/outro then split the rest across topics evenly.
+    """
+    total_chars = max(200, int((total_sec - head_tail_sec) * CHARS_PER_SEC))
+    per_topic = max(200, total_chars // max(1, topics_n))
+    return total_chars, per_topic, [per_topic]*topics_n
+
+def _llm_script_for_topic(topic: str, items: List[Dict], char_budget: int, language: str, tone: str) -> Tuple[str, List[Dict]]:
+    """
+    Use only the supplied items. Returns (script_text, used_items).
+    """
+    if not items:
+        return "", []
+    # Build short context (titles + snippets from Tavily are limited; we rely on titles + sources)
+    cites = []
+    for idx, it in enumerate(items, 1):
+        cites.append(f"[{idx}] {it['title']} — {it.get('source','')} ({it.get('published','')}) :: {it['url']}")
+
+    sys = (
+        "You are a journalist. Summarize ONLY the facts from the provided sources. "
+        "No background, no opinion, no speculation. Keep it timely (within the last 24–72 hours). "
+        "Write in {language}, tone: {tone}. Use concise sentences suitable for voice-over."
+    ).format(language=language, tone=tone)
+
+    user = (
+        "TOPIC: {topic}\n"
+        "TARGET_CHARS: {chars}\n"
+        "RULES:\n"
+        " - Use ONLY facts from the SOURCES list (do not invent anything).\n"
+        " - Prefer news that is within the last 24 hours when possible.\n"
+        " - Keep every sentence informative; no filler.\n"
+        " - Output plain text (no markdown). 5–10 short sentences max.\n\n"
+        "SOURCES:\n{src}\n\n"
+        "Write the script now. If sources are insufficient for {topic}, write nothing."
+    ).format(topic=topic, chars=char_budget, src="\n".join(cites))
+
+    resp = oai.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        messages=[
+            {"role":"system","content":sys},
+            {"role":"user","content":user}
+        ],
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    # Enforce hard char ceiling
+    if len(text) > char_budget:
+        text = text[:char_budget].rsplit(".", 1)[0] + "."
+    # Select only items we referenced implicitly (we can't know; just pass through)
+    return text, items
+
+def _compose_full_script(intro: str, segments: List[Tuple[str,str]], outro: str) -> str:
+    """
+    segments: list of (header, body)
+    """
+    parts = []
+    if intro: parts.append(intro.strip())
+    for h, b in segments:
+        if b.strip():
+            if h: parts.append(h.strip())
+            parts.append(b.strip())
+    if outro: parts.append(outro.strip())
+    script = "\n\n".join([p for p in parts if p])
+    # Normalize spaces
+    script = re.sub(r"[ \t]+", " ", script)
+    return script.strip()
+
+# ----------------------------
+# Audio helpers
+# ----------------------------
+def trim_silence(seg: AudioSegment, head_ms: int = TRIM_HEAD_MS, tail_ms: int = TRIM_TAIL_MS, threshold_db: float = SILENCE_DB) -> AudioSegment:
+    try:
+        lead = detect_leading_silence(seg, silence_threshold=threshold_db)
+        rev  = seg.reverse()
+        trail = detect_leading_silence(rev, silence_threshold=threshold_db)
+    except TypeError:
+        lead = detect_leading_silence(seg, threshold_db)
+        rev  = seg.reverse()
+        trail = detect_leading_silence(rev, threshold_db)
+
+    start = max(0, lead - head_ms)
+    end   = len(seg) - max(0, trail - tail_ms)
+    trimmed = seg[start:end]
+    if len(trimmed) < 200:
+        trimmed = trimmed + AudioSegment.silent(duration=200)
+    return trimmed
+
+def _time_stretch(seg: AudioSegment, factor: float) -> AudioSegment:
+    """
+    factor > 1 => longer audio; factor < 1 => shorter audio
+    Uses frame-rate trick to keep pitch pleasant.
+    """
+    factor = max(STRETCH_MIN, min(STRETCH_MAX, factor))
+    new_rate = int(seg.frame_rate / factor)
+    stretched = seg._spawn(seg.raw_data, overrides={'frame_rate': new_rate})
+    return stretched.set_frame_rate(seg.frame_rate)
+
+def _eleven_tts(text: str, voice_id: str) -> AudioSegment:
+    if not ELEVEN_API_KEY:
+        raise RuntimeError("ELEVENLABS_API_KEY missing")
+    if not voice_id:
+        if not ELEVEN_VOICE_ID:
+            raise RuntimeError("No ElevenLabs voice_id configured")
+        voice_id = ELEVEN_VOICE_ID
+
+    url = f"{ELEVEN_TTS_URL}/{voice_id}/stream?optimize_streaming_latency=4"
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
+        "xi-api-key": ELEVEN_API_KEY,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json"
     }
     body = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role":"system","content":system},{"role":"user","content":user}],
-        "temperature": temperature,
-        "max_tokens": tokens,
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.46, "similarity_boost": 0.7, "style": 0.25, "use_speaker_boost": True}
     }
-    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"].strip()
-
-def openai_tts(text: str, voice: str = "alloy") -> AudioSegment:
-    if not HAS_OPENAI:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {
-        "model": "gpt-4o-mini-tts",
-        "voice": voice or "alloy",
-        "input": text,
-        "format": "mp3",  # OpenAI supports "mp3"
-    }
-    r = requests.post("https://api.openai.com/v1/audio/speech", headers=headers, json=body, timeout=120)
-    r.raise_for_status()
-    audio_bytes = r.content
-    return AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-
-# ------------- ElevenLabs TTS -------------
-def eleven_tts(text: str, voice_id: Optional[str] = None) -> AudioSegment:
-    if not HAS_ELEVEN:
-        raise RuntimeError("ELEVENLABS_API_KEY not set")
-    v = (voice_id or ELEVEN_VOICE_ID_DEF or "").strip() or "21m00Tcm4TlvDq8ikWAM"  # default premade voice if none
-    headers = {"xi-api-key": ELEVEN_API_KEY, "accept": "audio/mpeg", "Content-Type":"application/json"}
-    body = {"text": text, "model_id": "eleven_multilingual_v2", "voice_settings": {"stability":0.4,"similarity_boost":0.8}}
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{v}"
     r = requests.post(url, headers=headers, json=body, timeout=120)
     r.raise_for_status()
-    return AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
-
-# ------------- Voice calibration & timing -------------
-def measure_wpm(tts_provider: str, voice_id: Optional[str]) -> Tuple[float, str]:
-    """
-    Synthesize ~60 word snippet and measure duration to estimate WPM.
-    """
-    sample = (
-        "This is a short calibration to measure speaking speed for exact timing. "
-        "Please ignore. After this, your bulletin will begin."
-    )
-    if tts_provider == "elevenlabs" and HAS_ELEVEN:
-        seg = eleven_tts(sample, voice_id)
-        provider = "elevenlabs"
-    else:
-        seg = openai_tts(sample, voice_id or "alloy")
-        provider = "openai"
-    words = len(sample.split())
-    minutes = max(1e-6, len(seg) / 60000.0)
-    wpm = max(120.0, min(220.0, words / minutes))
-    # Trim all silence from calibration to avoid dead air later
-    seg = trim_silence(seg)
-    return (wpm, provider)
-
-def trim_silence(seg: AudioSegment, head_ms=300, tail_ms=400) -> AudioSegment:
-    # Trim long leading/trailing silence, keep a tiny ambience
-    lead = detect_leading_silence(seg, silence_threshold=-40)
-    rev = seg.reverse()
-    trail = detect_leading_silence(rev, silence_threshold=-40)
-    seg = seg[max(0, lead - head_ms): len(seg) - max(0, trail - tail_ms)]
+    raw = io.BytesIO(r.content)
+    seg = AudioSegment.from_file(raw, format="mp3")
     return seg
 
-# ------------- News aggregation -------------
-def gather_sources_per_topic(queries: List[str], hours: int, cap_per_topic: int, on_progress: Callable[[str], None]) -> Dict[str, List[Dict[str,str]]]:
-    """
-    Get fresh sources per topic. Guarantees up to cap_per_topic per topic when available.
-    """
-    sources_per = {}
-    for q in queries:
-        q_clean = q.strip()
-        on_progress(f"Search: {q_clean}")
-        items = []
-        if HAS_TAVILY:
-            items = tavily_search(q_clean, hours, max_results=cap_per_topic+3)
-        if not items:  # fallback RSS + filter titles
-            pool = rss_recent(hours, limit=80)
-            q_words = [w for w in re.split(r"\W+", q_clean.lower()) if w]
-            for p in pool:
-                title = (p.get("title") or "").lower()
-                if any(w in title for w in q_words):
-                    items.append(p)
-        sources_per[q_clean] = items[:cap_per_topic]
-    return sources_per
-
-# ------------- Bullet & Script writer -------------
-def bullets_for_topic(topic: str, sources: List[Dict[str,str]], lang: str, tone: str) -> List[str]:
-    """
-    Ask LLM for compact bullets tied to the *given sources* (last 24–72h).
-    """
-    cites = "\n".join(f"- {s.get('title')} — {s.get('url')}" for s in sources if s.get("url"))
-    system = f"You are Noah, a concise real-time news writer. Write in {lang}. Tone: {tone}. Focus on facts from the cited URLs only."
-    user = (
-        f"Topic: {topic}\n"
-        f"Sources (fresh):\n{cites}\n\n"
-        "Compose 4–6 compact bullet points (max ~22 words each). "
-        "Each bullet must be attributable to these sources; do not invent, do not summarize history. "
-        "Return each bullet prefixed by '• '."
-    )
-    text = openai_chat(system, user, temperature=0.2, tokens=500)
-    bulls = [re.sub(r"^[•\-\*]\s*", "", b).strip() for b in text.splitlines() if b.strip()]
-    return bulls[:8]
-
-def script_from_bullets(queries: List[str], per_topic_bullets: Dict[str,List[str]], lang: str, tone: str, target_words: int) -> str:
-    """
-    Force coverage across all topics first, then flow.
-    """
-    bundle = []
-    for q in queries:
-        b = per_topic_bullets.get(q.strip(), [])
-        if b:
-            bundle.append(f"{q.strip()}:\n" + "\n".join(f"- {x}" for x in b))
-    joined = "\n\n".join(bundle)
-    sys = f"You are Noah, a crisp daily news narrator. Language: {lang}. Tone: {tone}."
-    usr = (
-        "Using ONLY the listed bullets (which are extracted from verified sources), craft a spoken news script. "
-        "Rules:\n"
-        "1) Cover every topic section in the order given.\n"
-        "2) Keep it factual and *current* — no background history unless needed for one-sentence context.\n"
-        f"3) Aim for about {target_words} words total.\n"
-        "4) Use short sentences. Smooth but efficient transitions between topics.\n"
-        "5) No repetition. No disclaimers.\n\n"
-        f"Bullets grouped by topic:\n{joined}\n\n"
-        "Return only the script paragraphs."
-    )
-    return openai_chat(sys, usr, temperature=0.35, tokens=1600)
-
-def continuation_script(lang: str, tone: str, remaining_words: int, queries: List[str], used_topics: List[str]) -> str:
-    sys = f"You are Noah, a crisp daily news narrator. Language: {lang}. Tone: {tone}."
-    usr = (
-        "We need a continuation segment for the same bulletin. "
-        f"Write about {remaining_words} words, expanding with *new, fresh* lines that add depth and detail. "
-        "Do not repeat earlier lines. Keep transitions tight. No filler."
-    )
-    return openai_chat(sys, usr, temperature=0.45, tokens=1200)
-
-# ------------- Synthesis pipeline -------------
-def synthesize(tts_provider: str, voice_id: Optional[str], text: str) -> AudioSegment:
-    if tts_provider == "elevenlabs" and HAS_ELEVEN:
-        seg = eleven_tts(text, voice_id)
-        return trim_silence(seg)
-    # default OpenAI
-    seg = openai_tts(text, voice_id or "alloy")
-    return trim_silence(seg)
-
-# ------------- Public entry point -------------
-def make_noah_audio(
-    queries_raw: str,
-    language: str,
-    tone: str,
-    recent_hours: int,
-    cap_per_query: int,
-    min_minutes: float,
-    exact_minutes: bool,
-    voice_id: Optional[str],
-    on_progress: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
-    """
-    Main orchestrator called by FastAPI worker thread.
-    """
-    on_progress = on_progress or (lambda _msg: None)
-
-    # Normalize topics
-    topics = [t.strip() for t in re.split(r"[\n\r]+", queries_raw or "") if t.strip()]
-    if not topics:
-        topics = ["world news"]
-
-    # 1) Collect sources per topic (guarantee at least per-topic coverage)
-    on_progress("Collecting fresh sources")
-    per_topic_sources = gather_sources_per_topic(topics, recent_hours, cap_per_query, on_progress)
-
-    # 2) Convert sources to bullets (per topic)
-    on_progress("Draft bullets per topic")
-    per_topic_bullets: Dict[str, List[str]] = {}
-    for q in topics:
-        srcs = per_topic_sources.get(q, [])
-        if not srcs:
-            per_topic_bullets[q] = []
-            continue
-        per_topic_bullets[q] = bullets_for_topic(q, srcs, language, tone)
-        time.sleep(0.3)
-
-    # 3) Calibrate voice speed -> WPM
-    on_progress("Calibrating voice")
-    wpm, provider = measure_wpm("elevenlabs" if voice_id and HAS_ELEVEN else "openai", voice_id)
-
-    # 4) Target words plan
-    # Use ~95% of time for speech; keep ~5% headroom
-    target_minutes = float(min_minutes)
-    target_words = max(120, int(target_minutes * wpm * 0.95))
-
-    # 5) First script pass that covers all topics
-    on_progress("Draft Attempt 1")
-    script = script_from_bullets(topics, per_topic_bullets, language, tone, target_words)
-
-    # 6) Iterative expand to hit target minutes with real speech (no silence padding)
-    segs: List[AudioSegment] = []
-    combined = AudioSegment.silent(duration=0)
-    attempt = 1
-    MAX_ATTEMPTS = 5
-    while attempt <= MAX_ATTEMPTS:
-        on_progress(f"Correct Expand {len(script.split())}")
-        seg = synthesize(provider, voice_id, script)
-        segs.append(seg)
-        combined = sum(segs, AudioSegment.silent(duration=0))
-        actual_mins = len(combined) / 60000.0
-        if not exact_minutes:
-            break
-        # good enough?
-        if abs(actual_mins - target_minutes) <= max(0.25, target_minutes * 0.03):
-            break
-        if actual_mins < target_minutes:
-            # Need more content: ask LLM for continuation ~ remaining words
-            remaining = max(80, int((target_minutes - actual_mins) * wpm * 0.98))
-            on_progress(f"Draft Attempt {attempt+1}")
-            script = continuation_script(language, tone, remaining, topics, [])
-            attempt += 1
-            continue
-        else:
-            # Slightly too long — speed-up by tiny pitch/tempo? Prefer not (quality hit).
-            # Instead, stop if within 5%. Otherwise ask for a shorter closing paragraph and replace last seg.
-            if (actual_mins - target_minutes) <= max(0.35, target_minutes * 0.05):
-                break
-            on_progress("Trim long tail with a brief closing")
-            closing = openai_chat(
-                f"You are Noah, a crisp anchor. Language: {language}. Tone: {tone}.",
-                "Write a 2–3 sentence closing that wraps up the bulletin politely. 35–50 words.",
-                temperature=0.4,
-                tokens=120,
-            )
-            # Replace last seg with the closing only
-            segs[-1] = synthesize(provider, voice_id, closing)
-            combined = sum(segs, AudioSegment.silent(duration=0))
-            break
-
-    # Natural tiny tail; no long silent padding
-    combined = trim_silence(combined)
-
-    # 7) Build sources list (flatten per-topic to a single list, keep order)
-    srcs_flat: List[Dict[str,str]] = []
-    for q in topics:
-        for s in per_topic_sources.get(q, []):
-            srcs_flat.append({"title": s.get("title",""), "url": s.get("url","")})
-
-    # 8) Export MP3
-    file_id = uuid.uuid4().hex
-    mp3_name = f"noah-{slug(','.join(topics))[:48]}-{file_id}.mp3"
-    mp3_path = DATA_DIR / mp3_name
-    combined.export(str(mp3_path), format="mp3", bitrate="128k")
-
-    actual_minutes = round(len(combined) / 60000.0, 2)
-
-    # 9) Bullet list for the UI (compact summary)
-    bullets_all: List[str] = []
-    for q in topics:
-        bs = per_topic_bullets.get(q, [])
-        if bs:
-            bullets_all.append(f"{q}:")
-            bullets_all.extend(bs[:6])
-
+# ----------------------------
+# Public entry
+# ----------------------------
+def health_check() -> Dict:
     return {
-        "script": "",  # (optional; can be large; you can return it if you want)
-        "bullets": bullets_all,
-        "sources": srcs_flat,
-        "mp3_path": str(mp3_path),
-        "mp3_name": mp3_name,
-        "actual_minutes": actual_minutes,
-        "target_minutes": target_minutes,
-        "playback_rate": 1.0,  # we did not time-warp; we used real extra content
-        "tts_provider": provider,
+        "openai": bool(OPENAI_API_KEY),
+        "elevenlabs": bool(ELEVEN_API_KEY),
+        "tavily": bool(TAVILY_API_KEY),
+        "ok": bool(OPENAI_API_KEY and ELEVEN_API_KEY and TAVILY_API_KEY)
     }
 
-# ------------- Health check for /health -------------
-def health_check() -> Dict[str, bool]:
+def make_noah_audio(
+    queries: List[str],
+    minutes: int,
+    language: str,
+    tone: str,
+    lookback_hours: int,
+    cap_per_topic: int,
+    strict_timing: bool,
+    voice_id: str = ""
+) -> Dict:
+    """
+    Returns: dict with keys:
+      ok, target_sec, actual_sec, playback_rate, mp3_path, bullets_by_topic, sources_by_topic
+    """
+    assert minutes >= 2
+    target_sec = minutes * 60
+
+    # 1) Fetch recent sources per topic, with possible expansion
+    all_segments = []
+    bullets_out = {}
+    sources_out = {}
+
+    topics = [q.strip() for q in queries if q.strip()]
+    topics = topics[:6] if topics else ["Top headlines"]  # safety
+
+    total_chars, per_topic_chars, per_topic_budgets = _allocate_char_budget(target_sec, len(topics))
+    per_topic_limit = max(2, min(MAX_RESULTS_PER_TOPIC, cap_per_topic))
+
+    for i, topic in enumerate(topics):
+        gathered = []
+        attempts = 0
+        while len(gathered) < per_topic_limit and attempts < 3:
+            need = min(BATCH_FETCH, per_topic_limit - len(gathered))
+            got = _tavily_news(topic, lookback_hours, limit=need)
+            # de-dup with ones we already have
+            cur_urls = {g["url"] for g in gathered}
+            fresh = [x for x in got if x["url"] not in cur_urls]
+            if not fresh:
+                break
+            gathered.extend(fresh)
+            attempts += 1
+
+        # If absolutely nothing, skip this topic
+        if not gathered:
+            continue
+
+        # Build a compact script from only these fresh items
+        body, used = _llm_script_for_topic(topic, gathered[:per_topic_limit], per_topic_budgets[i], language, tone)
+
+        # record bullets and sources to show in UI
+        bullets_out[topic] = [f"- {u['title']}" for u in used]
+        sources_out[topic] = used
+
+        all_segments.append((f"{topic}:", body))
+
+    # 2) Compose full script with tight intro/outro (no filler)
+    intro = f"Welcome to your daily Noah. Here are the latest updates."
+    outro = "That’s your briefing for now. See you tomorrow."
+    script = _compose_full_script(intro, all_segments, outro)
+
+    # If script too small (not enough news), try expanding each topic once more
+    est_sec = max(2.0, len(script) / CHARS_PER_SEC)
+    if est_sec < target_sec * 0.7:
+        # one more pass to fetch a few more headlines (still recent)
+        for i, topic in enumerate(topics):
+            gathered = sources_out.get(topic, [])
+            if len(gathered) >= per_topic_limit:
+                continue
+            need = min(BATCH_FETCH, per_topic_limit - len(gathered))
+            extra = _tavily_news(topic, lookback_hours, limit=need)
+            cur = {x["url"] for x in gathered}
+            extra = [x for x in extra if x["url"] not in cur]
+            if not extra:
+                continue
+            # Summarize the extra into 2–3 tight lines to extend time
+            add_body, used_extra = _llm_script_for_topic(topic, extra, per_topic_budgets[i]//2, language, tone)
+            if add_body.strip():
+                # append after the existing section for that topic
+                for k, (h, b) in enumerate(all_segments):
+                    if h.lower().startswith(topic.lower()):
+                        all_segments[k] = (h, b + "\n" + add_body)
+                        break
+                bullets_out[topic].extend([f"- {u['title']}" for u in used_extra])
+                sources_out[topic].extend(used_extra)
+
+        script = _compose_full_script(intro, all_segments, outro)
+
+    # 3) TTS once; then time-stretch to exact target if strict requested
+    #    (No padding with silence, no random filler)
+    voice_to_use = voice_id or ELEVEN_VOICE_ID
+    if not voice_to_use:
+        raise RuntimeError("No voice_id configured for ElevenLabs.")
+
+    audio = _eleven_tts(script, voice_to_use)
+    audio = trim_silence(audio)
+
+    actual = len(audio) / 1000.0
+    rate = 1.0
+
+    if strict_timing and abs(actual - target_sec) > 1.0:
+        rate = target_sec / actual
+        audio = _time_stretch(audio, factor=rate)
+        audio = trim_silence(audio)
+        actual = len(audio) / 1000.0
+
+    # 4) Persist mp3 to disk for download
+    safe_ts = int(time.time())
+    fname = f"noah_{safe_ts}.mp3"
+    out_dir = os.getenv("AUDIO_DIR", "/tmp")
+    os.makedirs(out_dir, exist_ok=True)
+    fpath = os.path.join(out_dir, fname)
+    audio.export(fpath, format="mp3", bitrate="128k")
+
     return {
-        "openai": HAS_OPENAI,
-        "elevenlabs": HAS_ELEVEN,
-        "tavily": HAS_TAVILY,
-        "storage": DATA_DIR.exists(),
+        "ok": True,
+        "target_sec": target_sec,
+        "actual_sec": round(actual, 2),
+        "playback_rate": round(rate, 3),
+        "mp3_path": fpath,
+        "bullets_by_topic": bullets_out,
+        "sources_by_topic": sources_out,
+        "script_chars": len(script)
     }

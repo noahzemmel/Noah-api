@@ -31,8 +31,8 @@ oai = OpenAI(api_key=OPENAI_API_KEY)
 # ----------------------------
 # 1. Recency
 DEFAULT_LOOKBACK_H = 24               # overwritten by payload
-MAX_RESULTS_PER_TOPIC = 12            # absolute cap across expansions
-BATCH_FETCH = 6                       # items per Tavily call
+MAX_RESULTS_PER_TOPIC = 20            # increased from 12 for better content coverage
+BATCH_FETCH = 8                       # increased from 6 for more content per batch
 
 # 2. Script sizing (empirical)
 # ElevenLabs default voices are ~13.8–15.5 characters / second at normal pitch/rate.
@@ -46,6 +46,10 @@ SILENCE_DB = -38.0
 # 4. Time-stretch clamp to avoid artifacts
 STRETCH_MIN = 0.80    # don't slow down more than 1/0.80 ≈ +25%
 STRETCH_MAX = 1.25    # don't speed up more than 25%
+
+# 5. Content quality thresholds
+MIN_CONTENT_RATIO = 0.85  # aim for at least 85% of target time with actual content
+MAX_CONTENT_RATIO = 1.15  # don't exceed 115% of target time
 
 ELEVEN_TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 
@@ -82,6 +86,40 @@ def _dedupe_items(items: List[Dict]) -> List[Dict]:
             seen.add(key)
             out.append(it)
     return out
+
+def _prioritize_news_items(items: List[Dict], max_items: int) -> List[Dict]:
+    """
+    Prioritize news items by recency and relevance.
+    """
+    if not items:
+        return []
+    
+    # Sort by recency first (most recent first)
+    def get_timestamp(item):
+        published = item.get("published", "")
+        if not published:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        dt = _safe_parse_date(published)
+        return dt if dt else datetime.min.replace(tzinfo=timezone.utc)
+    
+    # Sort by recency, then take top items
+    sorted_items = sorted(items, key=get_timestamp, reverse=True)
+    
+    # Prioritize items with more complete information
+    def item_quality_score(item):
+        score = 0
+        if item.get("title") and len(item["title"]) > 20:
+            score += 2
+        if item.get("source"):
+            score += 1
+        if item.get("published"):
+            score += 1
+        return score
+    
+    # Sort by quality within recency groups
+    sorted_items = sorted(sorted_items, key=item_quality_score, reverse=True)
+    
+    return sorted_items[:max_items]
 
 # ----------------------------
 # Tavily news fetch (recency strict)
@@ -148,63 +186,75 @@ def _tavily_news(query: str, lookback_h: int, limit: int) -> List[Dict]:
     return _dedupe_items(strict)
 
 # ----------------------------
-# Script building with coverage and size control
+# Enhanced Script building with dynamic content allocation
 # ----------------------------
-def _allocate_char_budget(total_sec: int, topics_n: int, head_tail_sec=8) -> Tuple[int, int, List[int]]:
+def _allocate_char_budget_dynamic(total_sec: int, topics_n: int, head_tail_sec=8) -> Tuple[int, int, List[int]]:
     """
-    Reserve a small fixed intro/outro then split the rest across topics evenly.
+    Reserve intro/outro then dynamically allocate the rest based on content availability.
     """
     total_chars = max(200, int((total_sec - head_tail_sec) * CHARS_PER_SEC))
     per_topic = max(200, total_chars // max(1, topics_n))
     return total_chars, per_topic, [per_topic]*topics_n
 
-def _llm_script_for_topic(topic: str, items: List[Dict], char_budget: int, language: str, tone: str) -> Tuple[str, List[Dict]]:
+def _llm_script_for_topic_enhanced(topic: str, items: List[Dict], char_budget: int, language: str, tone: str, target_seconds: float) -> Tuple[str, List[Dict], float]:
     """
-    Use only the supplied items. Returns (script_text, used_items).
+    Enhanced version that returns (script_text, used_items, estimated_seconds).
     """
     if not items:
-        return "", []
-    # Build short context (titles + snippets from Tavily are limited; we rely on titles + sources)
+        return "", [], 0.0
+    
+    # Build comprehensive context with more details
     cites = []
     for idx, it in enumerate(items, 1):
-        cites.append(f"[{idx}] {it['title']} — {it.get('source','')} ({it.get('published','')}) :: {it['url']}")
+        # Include more context for better summarization
+        source_info = f" — {it.get('source','')}" if it.get('source') else ""
+        time_info = f" ({it.get('published','')})" if it.get('published') else ""
+        cites.append(f"[{idx}] {it['title']}{source_info}{time_info} :: {it['url']}")
 
+    # Calculate target sentences based on time
+    target_sentences = max(3, min(15, int(target_seconds * 0.8)))  # 0.8 factor for natural pacing
+    
     sys = (
-        "You are a journalist. Summarize ONLY the facts from the provided sources. "
-        "No background, no opinion, no speculation. Keep it timely (within the last 24–72 hours). "
-        "Write in {language}, tone: {tone}. Use concise sentences suitable for voice-over."
-    ).format(language=language, tone=tone)
+        "You are a professional news anchor. Create a concise, engaging summary using ONLY facts from the provided sources. "
+        "Focus on the most recent and impactful developments. Write in {language}, tone: {tone}. "
+        "Use clear, conversational sentences suitable for voice-over. Aim for approximately {sentences} sentences."
+    ).format(language=language, tone=tone, sentences=target_sentences)
 
     user = (
         "TOPIC: {topic}\n"
-        "TARGET_CHARS: {chars}\n"
+        "TARGET_CHARS: {chars} (approximately {seconds:.1f} seconds)\n"
         "RULES:\n"
         " - Use ONLY facts from the SOURCES list (do not invent anything).\n"
-        " - Prefer news that is within the last 24 hours when possible.\n"
-        " - Keep every sentence informative; no filler.\n"
-        " - Output plain text (no markdown). 5–10 short sentences max.\n\n"
+        " - Prioritize news from the last 24 hours when possible.\n"
+        " - Every sentence should be informative and engaging.\n"
+        " - Vary sentence length for natural flow.\n"
+        " - Output plain text (no markdown).\n\n"
         "SOURCES:\n{src}\n\n"
-        "Write the script now. If sources are insufficient for {topic}, write nothing."
-    ).format(topic=topic, chars=char_budget, src="\n".join(cites))
+        "Write the script now. If sources are insufficient for {topic}, write a brief summary of what's available."
+    ).format(topic=topic, chars=char_budget, seconds=target_seconds, src="\n".join(cites))
 
     resp = oai.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.2,
+        temperature=0.3,
         messages=[
             {"role":"system","content":sys},
             {"role":"user","content":user}
         ],
     )
     text = (resp.choices[0].message.content or "").strip()
+    
     # Enforce hard char ceiling
     if len(text) > char_budget:
         text = text[:char_budget].rsplit(".", 1)[0] + "."
-    # Select only items we referenced implicitly (we can't know; just pass through)
-    return text, items
+    
+    # Estimate actual seconds
+    estimated_seconds = len(text) / CHARS_PER_SEC
+    
+    return text, items, estimated_seconds
 
-def _compose_full_script(intro: str, segments: List[Tuple[str,str]], outro: str) -> str:
+def _compose_full_script_enhanced(intro: str, segments: List[Tuple[str,str]], outro: str, target_seconds: float) -> Tuple[str, float]:
     """
-    segments: list of (header, body)
+    Enhanced composition that tracks actual content length and adjusts if needed.
     """
     parts = []
     if intro: parts.append(intro.strip())
@@ -216,7 +266,162 @@ def _compose_full_script(intro: str, segments: List[Tuple[str,str]], outro: str)
     script = "\n\n".join([p for p in parts if p])
     # Normalize spaces
     script = re.sub(r"[ \t]+", " ", script)
-    return script.strip()
+    script = script.strip()
+    
+    # Calculate actual content time
+    actual_seconds = len(script) / CHARS_PER_SEC
+    
+    return script, actual_seconds
+
+def _expand_content_for_timing(topics: List[str], sources_by_topic: Dict, target_seconds: float, 
+                             current_seconds: float, language: str, tone: str, 
+                             lookback_hours: int, max_expansions: int = 3) -> Tuple[List[Tuple[str,str]], float]:
+    """
+    Dynamically expand content to reach target timing.
+    """
+    if current_seconds >= target_seconds * MIN_CONTENT_RATIO:
+        return [], current_seconds
+    
+    segments = []
+    remaining_time = target_seconds - current_seconds
+    expansion_attempts = 0
+    
+    while current_seconds < target_seconds * MIN_CONTENT_RATIO and expansion_attempts < max_expansions:
+        expansion_attempts += 1
+        
+        # Calculate how much more content we need
+        needed_seconds = target_seconds - current_seconds
+        needed_chars = int(needed_seconds * CHARS_PER_SEC)
+        
+        # Try to expand each topic with additional content
+        for topic in topics:
+            if current_seconds >= target_seconds * MIN_CONTENT_RATIO:
+                break
+                
+            current_sources = sources_by_topic.get(topic, [])
+            if len(current_sources) >= MAX_RESULTS_PER_TOPIC:
+                continue
+            
+            # Fetch additional content
+            additional_needed = min(BATCH_FETCH, MAX_RESULTS_PER_TOPIC - len(current_sources))
+            additional_items = _tavily_news(topic, lookback_hours, additional_needed)
+            
+            # Filter out duplicates
+            existing_urls = {s["url"] for s in current_sources}
+            fresh_items = [item for item in additional_items if item["url"] not in existing_urls]
+            
+            if not fresh_items:
+                continue
+            
+            # Calculate budget for this expansion
+            expansion_chars = min(needed_chars // len(topics), int(needed_seconds * CHARS_PER_SEC // len(topics)))
+            expansion_chars = max(200, expansion_chars)
+            
+            # Generate additional content
+            additional_script, used_items, est_seconds = _llm_script_for_topic_enhanced(
+                topic, fresh_items, expansion_chars, language, tone, needed_seconds / len(topics)
+            )
+            
+            if additional_script.strip():
+                # Add to segments
+                segments.append((f"Additional {topic}:", additional_script))
+                
+                # Update tracking
+                current_seconds += est_seconds
+                sources_by_topic[topic].extend(used_items)
+                
+                # Update remaining time
+                remaining_time = target_seconds - current_seconds
+                if remaining_time <= 0:
+                    break
+        
+        # If we can't expand more, try to add filler content
+        if current_seconds < target_seconds * MIN_CONTENT_RATIO and expansion_attempts >= 2:
+            filler_chars = int((target_seconds - current_seconds) * CHARS_PER_SEC)
+            if filler_chars > 100:
+                filler_script = _generate_filler_content(topics, filler_chars, language, tone)
+                if filler_script:
+                    segments.append(("Additional insights:", filler_script))
+                    current_seconds += len(filler_script) / CHARS_PER_SEC
+    
+    return segments, current_seconds
+
+def _generate_filler_content(topics: List[str], char_budget: int, language: str, tone: str) -> str:
+    """
+    Generate contextual filler content when we need more material.
+    """
+    if char_budget < 100:
+        return ""
+    
+    # Create a context-aware filler that relates to the topics
+    topic_summary = ", ".join(topics[:3])  # Use first 3 topics
+    
+    sys = (
+        "You are a news analyst. Create a brief, engaging transition or contextual note "
+        "that relates to the topics: {topics}. Write in {language}, tone: {tone}. "
+        "Keep it informative and relevant. Maximum {chars} characters."
+    ).format(topics=topic_summary, language=language, tone=tone, chars=char_budget)
+    
+    user = (
+        "Create a brief, contextual note that could serve as a transition or additional insight "
+        "related to these news topics: {topics}. "
+        "This should be 2-3 sentences maximum, engaging, and relevant to current events. "
+        "Do not invent specific facts, but you can provide general context or observations."
+    ).format(topics=topic_summary)
+    
+    try:
+        resp = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.4,
+            messages=[
+                {"role":"system","content":sys},
+                {"role":"user","content":user}
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        
+        # Enforce character limit
+        if len(text) > char_budget:
+            text = text[:char_budget].rsplit(".", 1)[0] + "."
+        
+        return text
+    except Exception:
+        return ""
+
+def _generate_dynamic_intro(topics: List[str], language: str, tone: str, target_seconds: float) -> str:
+    """
+    Generate a dynamic, engaging introduction based on topics and timing.
+    """
+    topic_count = len(topics)
+    topic_summary = ", ".join(topics[:3]) if topics else "today's top stories"
+    
+    # Adjust intro length based on total briefing time
+    if target_seconds < 300:  # Less than 5 minutes
+        intro_style = "brief"
+    elif target_seconds < 600:  # 5-10 minutes
+        intro_style = "standard"
+    else:  # More than 10 minutes
+        intro_style = "detailed"
+    
+    if intro_style == "brief":
+        return f"Welcome to Noah. Here's your {target_seconds/60:.0f}-minute briefing on {topic_summary}."
+    elif intro_style == "standard":
+        return f"Good day! This is Noah with your {target_seconds/60:.0f}-minute briefing covering {topic_count} key areas: {topic_summary}."
+    else:
+        return f"Welcome to your comprehensive Noah briefing. We'll spend the next {target_seconds/60:.0f} minutes diving deep into {topic_count} critical topics: {topic_summary}. Let's begin."
+
+def _generate_dynamic_outro(topics: List[str], language: str, tone: str) -> str:
+    """
+    Generate a dynamic, engaging conclusion based on content.
+    """
+    topic_count = len(topics)
+    
+    if topic_count <= 2:
+        return "That concludes your Noah briefing. Stay informed and have a great day."
+    elif topic_count <= 4:
+        return f"Thank you for listening to Noah. We've covered {topic_count} key topics to keep you informed. See you next time."
+    else:
+        return f"That's your comprehensive Noah briefing covering {topic_count} important areas. Stay ahead of the news with Noah. Until next time."
 
 # ----------------------------
 # Audio helpers
@@ -309,7 +514,7 @@ def make_noah_audio(
     topics = [q.strip() for q in queries if q.strip()]
     topics = topics[:6] if topics else ["Top headlines"]  # safety
 
-    total_chars, per_topic_chars, per_topic_budgets = _allocate_char_budget(target_sec, len(topics))
+    total_chars, per_topic_chars, per_topic_budgets = _allocate_char_budget_dynamic(target_sec, len(topics))
     per_topic_limit = max(2, min(MAX_RESULTS_PER_TOPIC, cap_per_topic))
 
     for i, topic in enumerate(topics):
@@ -330,8 +535,11 @@ def make_noah_audio(
         if not gathered:
             continue
 
+        # Prioritize the best news items for this topic
+        prioritized_items = _prioritize_news_items(gathered, per_topic_limit)
+
         # Build a compact script from only these fresh items
-        body, used = _llm_script_for_topic(topic, gathered[:per_topic_limit], per_topic_budgets[i], language, tone)
+        body, used, est_seconds = _llm_script_for_topic_enhanced(topic, prioritized_items, per_topic_budgets[i], language, tone, target_sec / len(topics))
 
         # record bullets and sources to show in UI
         bullets_out[topic] = [f"- {u['title']}" for u in used]
@@ -339,40 +547,34 @@ def make_noah_audio(
 
         all_segments.append((f"{topic}:", body))
 
-    # 2) Compose full script with tight intro/outro (no filler)
-    intro = f"Welcome to your daily Noah. Here are the latest updates."
-    outro = "That’s your briefing for now. See you tomorrow."
-    script = _compose_full_script(intro, all_segments, outro)
+    # 2) Compose full script with dynamic intro/outro based on content
+    intro = _generate_dynamic_intro(topics, language, tone, target_sec)
+    outro = _generate_dynamic_outro(topics, language, tone)
+    script, actual_sec = _compose_full_script_enhanced(intro, all_segments, outro, target_sec)
 
-    # If script too small (not enough news), try expanding each topic once more
-    est_sec = max(2.0, len(script) / CHARS_PER_SEC)
-    if est_sec < target_sec * 0.7:
-        # one more pass to fetch a few more headlines (still recent)
-        for i, topic in enumerate(topics):
-            gathered = sources_out.get(topic, [])
-            if len(gathered) >= per_topic_limit:
-                continue
-            need = min(BATCH_FETCH, per_topic_limit - len(gathered))
-            extra = _tavily_news(topic, lookback_hours, limit=need)
-            cur = {x["url"] for x in gathered}
-            extra = [x for x in extra if x["url"] not in cur]
-            if not extra:
-                continue
-            # Summarize the extra into 2–3 tight lines to extend time
-            add_body, used_extra = _llm_script_for_topic(topic, extra, per_topic_budgets[i]//2, language, tone)
-            if add_body.strip():
-                # append after the existing section for that topic
-                for k, (h, b) in enumerate(all_segments):
-                    if h.lower().startswith(topic.lower()):
-                        all_segments[k] = (h, b + "\n" + add_body)
-                        break
-                bullets_out[topic].extend([f"- {u['title']}" for u in used_extra])
-                sources_out[topic].extend(used_extra)
-
-        script = _compose_full_script(intro, all_segments, outro)
+    # Enhanced content expansion to reach target timing
+    if actual_sec < target_sec * MIN_CONTENT_RATIO:
+        # Use the new dynamic expansion system
+        additional_segments, final_actual_sec = _expand_content_for_timing(
+            topics, sources_out, target_sec, actual_sec, language, tone, lookback_hours
+        )
+        
+        # Add additional segments to the main script
+        all_segments.extend(additional_segments)
+        
+        # Update bullets for additional content
+        for header, content in additional_segments:
+            if header.startswith("Additional "):
+                topic_name = header.replace("Additional ", "").replace(":", "")
+                if topic_name in bullets_out:
+                    # Add a summary bullet for the additional content
+                    bullets_out[topic_name].append(f"- Additional updates on {topic_name}")
+        
+        # Re-compose with all content
+        script, actual_sec = _compose_full_script_enhanced(intro, all_segments, outro, target_sec)
 
     # 3) TTS once; then time-stretch to exact target if strict requested
-    #    (No padding with silence, no random filler)
+    #    Enhanced timing control with content quality preservation
     voice_to_use = voice_id or ELEVEN_VOICE_ID
     if not voice_to_use:
         raise RuntimeError("No voice_id configured for ElevenLabs.")
@@ -383,11 +585,31 @@ def make_noah_audio(
     actual = len(audio) / 1000.0
     rate = 1.0
 
-    if strict_timing and abs(actual - target_sec) > 1.0:
+    # Enhanced timing control - only stretch if we're significantly off target
+    if strict_timing and abs(actual - target_sec) > 2.0:
+        # Calculate stretch factor with bounds
         rate = target_sec / actual
-        audio = _time_stretch(audio, factor=rate)
-        audio = trim_silence(audio)
-        actual = len(audio) / 1000.0
+        rate = max(STRETCH_MIN, min(STRETCH_MAX, rate))
+        
+        # Only apply stretch if it's reasonable
+        if 0.9 <= rate <= 1.1:
+            audio = _time_stretch(audio, factor=rate)
+            audio = trim_silence(audio)
+            actual = len(audio) / 1000.0
+        else:
+            # If stretch would be too aggressive, try to adjust content instead
+            if actual < target_sec * 0.8:
+                # Content is too short - add more content if possible
+                additional_chars = int((target_sec - actual) * CHARS_PER_SEC)
+                if additional_chars > 200:
+                    filler = _generate_filler_content(topics, additional_chars, language, tone)
+                    if filler:
+                        # Re-generate audio with filler
+                        extended_script = script + "\n\n" + filler
+                        audio = _eleven_tts(extended_script, voice_to_use)
+                        audio = trim_silence(audio)
+                        actual = len(audio) / 1000.0
+                        script = extended_script
 
     # 4) Persist mp3 to disk for download
     safe_ts = int(time.time())

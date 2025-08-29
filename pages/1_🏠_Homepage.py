@@ -1,6 +1,5 @@
-# homepage.py - Daily Noah homepage with authentication and subscription options
+# pages/1_🏠_Homepage.py - Daily Noah homepage with authentication
 import streamlit as st
-import streamlit_authenticator as stauth
 from auth_service import AuthService
 import json
 
@@ -139,7 +138,8 @@ def show_homepage():
                     st.session_state.session_token = result["session_token"]
                     st.session_state.subscription = result["subscription"]
                     st.success("Login successful! Redirecting to your dashboard...")
-                    st.rerun()
+                    # Redirect to main app
+                    st.switch_page("app.py")
                 else:
                     st.error(result["error"])
     
@@ -152,9 +152,5 @@ def show_homepage():
     </div>
     """, unsafe_allow_html=True)
 
-def main():
-    """Main function to run the homepage"""
-    show_homepage()
-
-if __name__ == "__main__":
-    main()
+# Main execution
+show_homepage()

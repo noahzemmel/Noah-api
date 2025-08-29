@@ -15,12 +15,148 @@ def check_authentication():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
-    if not st.session_state.authenticated:
-        # Redirect to homepage
-        st.switch_page("homepage.py")
-        return False
+    return st.session_state.authenticated
+
+def show_homepage():
+    """Show the homepage when user is not authenticated"""
+    st.set_page_config(
+        page_title="Daily Noah - AI-Powered News Briefings",
+        page_icon="🎙️",
+        layout="wide"
+    )
     
-    return True
+    # Header
+    st.markdown("""
+    <div style="text-align: center; padding: 2rem 0;">
+        <h1 style="font-size: 3.5rem; color: #1f77b4; margin-bottom: 1rem;">🎙️ Daily Noah</h1>
+        <h2 style="font-size: 2rem; color: #666; margin-bottom: 2rem;">AI-Powered News Briefings, Perfectly Timed</h2>
+        <p style="font-size: 1.2rem; color: #888; max-width: 600px; margin: 0 auto;">
+            Get personalized news bulletins in your language, your voice, exactly when you want them. 
+            Perfect for busy professionals who need to stay informed without the noise.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Main content area
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.markdown("### 🚀 How It Works")
+        st.markdown("""
+        1. **Choose Your Topics** - Select what interests you most
+        2. **Set Your Duration** - 1-15 minutes, perfectly timed
+        3. **Pick Your Voice** - Choose from premium AI voices
+        4. **Get Your Briefing** - AI-generated, human-quality news
+        """)
+        
+        st.markdown("### ✨ Key Features")
+        st.markdown("""
+        - 🎯 **Perfect Timing** - Exactly the duration you request
+        - 🌍 **Multi-Language** - English, Spanish, French, German, Italian
+        - 🎙️ **Premium Voices** - Professional AI voices from ElevenLabs
+        - 📰 **Recent News** - Latest updates from the last 24 hours
+        - 📱 **Mobile Ready** - Works perfectly on all devices
+        """)
+    
+    with col2:
+        st.markdown("### 💎 Subscription Plans")
+        
+        # Free Plan
+        with st.container():
+            st.markdown("#### 🆓 Free Plan")
+            st.markdown("**£0/month**")
+            st.markdown("""
+            - ✅ Generate news briefings
+            - ✅ Basic voice options
+            - ✅ Standard timing accuracy
+            - ❌ Ad-supported experience
+            - ❌ No downloads
+            - ❌ Limited customization
+            """)
+        
+        # Premium Plan
+        with st.container():
+            st.markdown("#### 💎 Premium Plan")
+            st.markdown("**£7.99/month**")
+            st.markdown("""
+            - ✅ **Everything in Free**
+            - ✅ **Ad-free experience**
+            - ✅ **Fast downloads** (10x faster)
+            - ✅ **All premium voices**
+            - ✅ **Advanced customization**
+            - ✅ **Priority processing**
+            - ✅ **Export options**
+            """)
+            
+            st.button("🚀 Upgrade to Premium", use_container_width=True, type="primary")
+    
+    # Authentication Section
+    st.markdown("---")
+    st.markdown("### 🔐 Get Started")
+    
+    # Tabs for login/signup
+    tab1, tab2 = st.tabs(["📝 Sign Up", "🔑 Log In"])
+    
+    with tab1:
+        st.markdown("#### Create Your Account")
+        with st.form("signup_form"):
+            email = st.text_input("Email Address", placeholder="your@email.com")
+            password = st.text_input("Password", type="password", placeholder="Choose a strong password")
+            confirm_password = st.text_input("Confirm Password", type="password", placeholder="Confirm your password")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                agree_terms = st.checkbox("I agree to the Terms of Service")
+            with col2:
+                agree_privacy = st.checkbox("I agree to the Privacy Policy")
+            
+            submitted = st.form_submit_button("Create Account", use_container_width=True)
+            
+            if submitted:
+                if password != confirm_password:
+                    st.error("Passwords don't match!")
+                elif not agree_terms or not agree_privacy:
+                    st.error("Please agree to the terms and privacy policy")
+                elif len(password) < 8:
+                    st.error("Password must be at least 8 characters long")
+                else:
+                    auth_service = get_auth_service()
+                    result = auth_service.register_user(email, password)
+                    if result["success"]:
+                        st.success("Account created successfully! Please log in.")
+                    else:
+                        st.error(result["error"])
+    
+    with tab2:
+        st.markdown("#### Welcome Back")
+        with st.form("login_form"):
+            login_email = st.text_input("Email Address", key="login_email", placeholder="your@email.com")
+            login_password = st.text_input("Password", type="password", key="login_password", placeholder="Your password")
+            
+            submitted_login = st.form_submit_button("Log In", use_container_width=True)
+            
+            if submitted_login:
+                auth_service = get_auth_service()
+                result = auth_service.login_user(login_email, login_password)
+                if result["success"]:
+                    # Store session in session state
+                    st.session_state.authenticated = True
+                    st.session_state.user = result["user"]
+                    st.session_state.session_token = result["session_token"]
+                    st.session_state.subscription = result["subscription"]
+                    st.success("Login successful! Welcome to Daily Noah!")
+                    st.rerun()
+                else:
+                    st.error(result["error"])
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style="text-align: center; padding: 2rem 0; color: #666;">
+        <p>© 2024 Daily Noah. All rights reserved.</p>
+        <p>Built with ❤️ using AI, FastAPI, and Streamlit</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 def show_user_header():
     """Show user information and subscription status"""
@@ -80,10 +216,6 @@ def show_subscription_upgrade():
 def show_noah_interface():
     """Show the main Noah interface for authenticated users"""
     st.set_page_config(page_title="Noah — Daily Smart Bulletins", layout="wide")
-    
-    # Check authentication
-    if not check_authentication():
-        return
     
     # Show user header
     show_user_header()
@@ -337,5 +469,9 @@ def fetch_voices():
             {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel (Default)", "provider": "elevenlabs"},
         ]
 
+# Main execution - check authentication and show appropriate interface
 if __name__ == "__main__":
-    show_noah_interface()
+    if check_authentication():
+        show_noah_interface()
+    else:
+        show_homepage()

@@ -61,6 +61,10 @@ with st.sidebar:
 
     st.subheader("⏱️ Duration")
     duration = st.slider("Duration (minutes)", 1, 15, 5)
+    
+    # Precision timing control
+    strict_timing = st.checkbox("🎯 Enable Precision Timing", value=True, 
+                               help="When enabled, Noah will generate bulletins that are exactly the requested duration (±30 seconds)")
 
     st.subheader("🎨 Tone")
     tone = st.selectbox("Tone", ["professional", "friendly", "casual", "formal"], index=0)
@@ -87,7 +91,8 @@ if run:
             "language": language,
             "voice": voice_id,
             "duration": duration,
-            "tone": tone
+            "tone": tone,
+            "strict_timing": strict_timing
         }
         
         # Debug: Show what we're sending
@@ -137,10 +142,23 @@ if run:
                     st.warning("No audio generated.")
                 
                 st.subheader("📊 Details")
-                st.write(f"**Duration:** {result.get('duration_minutes', 0):.1f} minutes")
+                st.write(f"**Target Duration:** {result.get('target_duration_minutes', 0):.1f} minutes")
+                st.write(f"**Actual Duration:** {result.get('duration_minutes', 0):.2f} minutes")
+                
+                # Show timing accuracy
+                accuracy = result.get('duration_accuracy_minutes', 0)
+                if accuracy < 0.5:
+                    st.success(f"🎯 **Timing Accuracy:** EXACT (±{accuracy:.2f} minutes)")
+                elif accuracy < 1.0:
+                    st.info(f"🎯 **Timing Accuracy:** CLOSE (±{accuracy:.2f} minutes)")
+                else:
+                    st.warning(f"🎯 **Timing Accuracy:** APPROXIMATE (±{accuracy:.2f} minutes)")
+                
+                st.write(f"**Precision Timing:** {'✅ Enabled' if result.get('precision_timing', False) else '❌ Disabled'}")
                 st.write(f"**Topics:** {', '.join(result.get('topics', []))}")
                 st.write(f"**Language:** {result.get('language', 'Unknown')}")
                 st.write(f"**Voice:** {result.get('voice', 'Unknown')}")
+                st.write(f"**Word Count:** {result.get('word_count', 0)} words")
         
         else:
             status.error(f"❌ Error: {result.get('error', 'Unknown error')}")

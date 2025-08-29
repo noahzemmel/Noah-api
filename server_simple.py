@@ -45,6 +45,42 @@ async def voices():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching voices: {str(e)}")
 
+# Debug endpoint to test OpenAI API key
+@app.get("/debug/openai")
+async def debug_openai():
+    """Debug endpoint to test OpenAI API key"""
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {
+                "error": "OPENAI_API_KEY not found in environment",
+                "api_key_length": 0,
+                "api_key_preview": "None"
+            }
+        
+        # Test the API key
+        response = requests.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10
+        )
+        
+        return {
+            "api_key_found": True,
+            "api_key_length": len(api_key),
+            "api_key_preview": f"{api_key[:10]}...{api_key[-10:]}" if len(api_key) > 20 else api_key,
+            "openai_response_status": response.status_code,
+            "openai_response_ok": response.ok,
+            "openai_response_text": response.text[:200] if response.text else "No response text"
+        }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "api_key_found": bool(os.getenv("OPENAI_API_KEY")),
+            "api_key_length": len(os.getenv("OPENAI_API_KEY", ""))
+        }
+
 # Generate news bulletin
 @app.post("/generate")
 async def generate_bulletin(

@@ -184,6 +184,36 @@ if run:
                 st.write(f"**Language:** {result.get('language', 'Unknown')}")
                 st.write(f"**Voice:** {result.get('voice', 'Unknown')}")
                 st.write(f"**Word Count:** {result.get('word_count', 0)} words")
+                
+                # Show news quality information
+                news_quality = result.get('news_quality', {})
+                if news_quality:
+                    st.subheader("📰 News Quality")
+                    quality_score = news_quality.get('quality_score', 0)
+                    
+                    if quality_score > 80:
+                        st.success(f"🟢 **News Quality:** EXCELLENT ({quality_score:.1f}%)")
+                    elif quality_score > 60:
+                        st.info(f"🔵 **News Quality:** GOOD ({quality_score:.1f}%)")
+                    elif quality_score > 40:
+                        st.warning(f"🟡 **News Quality:** FAIR ({quality_score:.1f}%)")
+                    else:
+                        st.error(f"🔴 **News Quality:** POOR ({quality_score:.1f}%)")
+                    
+                    st.write(f"**Recent Articles:** {news_quality.get('recent_articles', 0)}/{news_quality.get('total_articles', 0)}")
+                    st.write(f"**High Relevance:** {news_quality.get('high_relevance_articles', 0)} articles")
+                    
+                    topics_with_news = news_quality.get('topics_with_news', [])
+                    topics_without_news = news_quality.get('topics_without_news', [])
+                    
+                    if topics_with_news:
+                        st.success(f"✅ **Topics with recent news:** {', '.join(topics_with_news)}")
+                    
+                    if topics_without_news:
+                        st.warning(f"⚠️ **Topics without recent news:** {', '.join(topics_without_news)}")
+                    
+                    if not news_quality.get('has_recent_news', False):
+                        st.info("💡 **Tip:** Try requesting different topics or check back later for fresh updates.")
         
         else:
             status.error(f"❌ Error: {result.get('error', 'Unknown error')}")

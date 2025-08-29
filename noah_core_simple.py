@@ -111,7 +111,7 @@ def health_check():
     return results
 
 def fetch_news(topics: List[str], lookback_hours: int = 24, cap_per_topic: int = 5):
-    """Fetch news from Tavily API"""
+    """Fetch recent, specific news updates from Tavily API"""
     try:
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
@@ -120,73 +120,170 @@ def fetch_news(topics: List[str], lookback_hours: int = 24, cap_per_topic: int =
         all_articles = []
         
         for topic in topics:
-            query = f"latest news about {topic}"
+            # Use more specific queries for recent updates
+            specific_queries = [
+                f"breaking news {topic} last 24 hours",
+                f"latest developments {topic} today",
+                f"recent updates {topic} this week",
+                f"new developments {topic} recent",
+                f"latest news {topic} updates"
+            ]
             
-            response = requests.post(TAVILY_SEARCH_URL, json={
-                "api_key": api_key,
-                "query": query,
-                "search_depth": "basic",
-                "max_results": cap_per_topic,
-                "include_answer": False,
-                "include_raw_content": False,
-                "include_images": False
-            })
-            
-            if response.status_code == 200:
-                data = response.json()
-                articles = data.get("results", [])
+            for query in specific_queries:
+                response = requests.post(TAVILY_SEARCH_URL, json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "advanced",  # Use advanced search for better results
+                    "max_results": min(cap_per_topic, 3),  # Limit per query
+                    "include_answer": False,
+                    "include_raw_content": True,  # Get full content for better analysis
+                    "include_images": False,
+                    "time_period": "1d"  # Focus on last 24 hours
+                })
                 
-                for article in articles:
-                    article["topic"] = topic
-                    all_articles.append(article)
-            else:
-                print(f"Tavily API error for topic {topic}: {response.status_code}")
+                if response.status_code == 200:
+                    data = response.json()
+                    articles = data.get("results", [])
+                    
+                    for article in articles:
+                        # Add metadata for better filtering
+                        article["topic"] = topic
+                        article["query_used"] = query
+                        article["relevance_score"] = calculate_relevance_score(article, topic)
+                        all_articles.append(article)
+                else:
+                    print(f"Tavily API error for query '{query}': {response.status_code}")
         
-        return all_articles
+        # Sort by relevance and recency, remove duplicates
+        unique_articles = remove_duplicate_articles(all_articles)
+        sorted_articles = sorted(unique_articles, key=lambda x: x.get("relevance_score", 0), reverse=True)
+        
+        # Take top articles per topic
+        final_articles = []
+        topic_counts = {}
+        
+        for article in sorted_articles:
+            topic = article["topic"]
+            if topic_counts.get(topic, 0) < cap_per_topic:
+                final_articles.append(article)
+                topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        
+        print(f"📰 Fetched {len(final_articles)} relevant articles from {len(all_articles)} total results")
+        return final_articles
+        
     except Exception as e:
         print(f"Error fetching news: {e}")
         return []
 
+def calculate_relevance_score(article: Dict, topic: str) -> float:
+    """Calculate relevance score based on recency, specificity, and topic match"""
+    score = 0.0
+    
+    # Base score for topic relevance
+    title = article.get("title", "").lower()
+    content = article.get("content", "").lower()
+    topic_lower = topic.lower()
+    
+    if topic_lower in title:
+        score += 3.0
+    elif topic_lower in content[:200]:  # First 200 chars
+        score += 2.0
+    
+    # Bonus for recent content indicators
+    if any(word in title.lower() for word in ["breaking", "latest", "new", "update", "developments", "announces", "reveals"]):
+        score += 2.0
+    
+    if any(word in content.lower() for word in ["today", "yesterday", "this week", "recently", "announced", "released"]):
+        score += 1.5
+    
+    # Bonus for specific companies/people mentioned
+    if any(word in content.lower() for word in ["announced", "said", "revealed", "confirmed", "launched"]):
+        score += 1.0
+    
+    # Penalty for generic content
+    if any(word in title.lower() for word in ["overview", "guide", "explained", "what is", "introduction"]):
+        score -= 1.0
+    
+    return score
+
+def remove_duplicate_articles(articles: List[Dict]) -> List[Dict]:
+    """Remove duplicate articles based on URL and title similarity"""
+    seen_urls = set()
+    seen_titles = set()
+    unique_articles = []
+    
+    for article in articles:
+        url = article.get("url", "")
+        title = article.get("title", "").lower()
+        
+        # Check if we've seen this URL or very similar title
+        if url not in seen_urls and not any(title_similarity(title, seen_title) > 0.8 for seen_title in seen_titles):
+            unique_articles.append(article)
+            seen_urls.add(url)
+            seen_titles.add(title)
+    
+    return unique_articles
+
+def title_similarity(title1: str, title2: str) -> float:
+    """Calculate similarity between two titles (simple implementation)"""
+    words1 = set(title1.split())
+    words2 = set(title2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union) if union else 0.0
+
 def generate_script(articles: List[Dict], topics: List[str], language: str, duration_minutes: int, tone: str = "professional"):
-    """Generate news script using GPT-4"""
+    """Generate news script focused on recent, specific updates"""
     try:
-        # Prepare articles text
+        # Prepare articles text with focus on recent developments
         articles_text = ""
         for article in articles:
             title = article.get("title", "")
             content = article.get("content", "")
             url = article.get("url", "")
             topic = article.get("topic", "")
+            relevance_score = article.get("relevance_score", 0)
             
-            articles_text += f"Topic: {topic}\nTitle: {title}\nContent: {content}\nURL: {url}\n\n"
+            articles_text += f"Topic: {topic}\nTitle: {title}\nContent: {content}\nURL: {url}\nRelevance Score: {relevance_score}\n\n"
         
         # Calculate target word count (roughly 150 words per minute)
         target_words = duration_minutes * 150
         
         prompt = f"""
-You are Noah, a professional news anchor. Create a {duration_minutes}-minute news bulletin in {language} with a {tone} tone.
+You are Noah, a professional news anchor delivering a {duration_minutes}-minute briefing in {language} with a {tone} tone.
 
-Topics to cover: {', '.join(topics)}
+Your mission: Provide busy professionals with SPECIFIC, RECENT updates on their requested topics. Focus on what happened in the last 24 hours, not general overviews.
 
-Available news articles:
+Topics requested: {', '.join(topics)}
+
+Available news articles (ranked by relevance and recency):
 {articles_text}
 
-Requirements:
-1. Create engaging, informative content
-2. Target approximately {target_words} words
-3. Structure as a professional news bulletin
-4. Include introduction and conclusion
-5. Make it sound natural when spoken aloud
-6. Focus on the most important and recent news
-7. If there's not enough news, add relevant background context
+CRITICAL REQUIREMENTS:
+1. Focus on SPECIFIC developments, announcements, and breaking news from the last 24 hours
+2. Avoid generic overviews, explanations, or background information
+3. Lead with the most recent and relevant updates first
+4. Include specific details: company names, people, numbers, dates, locations
+5. Structure as: "Company X announced Y today" or "Breaking: X happened in Y"
+6. If no recent news exists, say so clearly and don't fill with generic content
+7. Target approximately {target_words} words
+8. Make it sound natural when spoken aloud
+9. Each update should be actionable and informative
 
-Format the response as a clean script ready for text-to-speech.
+Format: Start with "Good [time], I'm Noah with your {duration_minutes}-minute briefing on [topics]." Then deliver specific updates, ending with "That concludes your briefing. Stay informed."
+
+Focus on WHAT HAPPENED, not what things are.
 """
 
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=4000,
+            max_tokens=2000,
             temperature=0.7
         )
         
@@ -238,23 +335,30 @@ def generate_script_with_precision(articles: List[Dict], topics: List[str], lang
             prompt = f"""
 You are Noah, a professional news anchor. {duration_instruction} in {language} with a {tone} tone.
 
+Your mission: Provide busy professionals with SPECIFIC, RECENT updates on their requested topics. Focus on what happened in the last 24 hours, not general overviews.
+
 Topics to cover: {', '.join(topics)}
 
-Available news articles:
+Available news articles (ranked by relevance and recency):
 {articles_text}
 
 CRITICAL REQUIREMENTS:
 1. Target EXACTLY {target_words} words (±15 words)
-2. Create engaging, informative content
-3. Structure as a professional news bulletin
-4. Include brief introduction and conclusion
-5. Make it sound natural when spoken aloud
-6. Focus on the most important and recent news
-7. Be precise with word count - this is for exact timing control
+2. Focus on SPECIFIC developments, announcements, and breaking news from the last 24 hours
+3. Avoid generic overviews, explanations, or background information
+4. Lead with the most recent and relevant updates first
+5. Include specific details: company names, people, numbers, dates, locations
+6. Structure as: "Company X announced Y today" or "Breaking: X happened in Y"
+7. If no recent news exists, say so clearly and don't fill with generic content
+8. Make it sound natural when spoken aloud
+9. Each update should be actionable and informative
+10. Be precise with word count - this is for exact timing control
 
 Current target: {target_words} words for {target_duration_minutes} minutes.
 
-Format the response as a clean script ready for text-to-speech.
+Format: Start with "Good [time], I'm Noah with your {target_duration_minutes}-minute briefing on [topics]." Then deliver specific updates, ending with "That concludes your briefing. Stay informed."
+
+Focus on WHAT HAPPENED, not what things are.
 """
 
             response = client.chat.completions.create(
@@ -449,13 +553,16 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
         print("📰 Fetching latest news...")
         articles = fetch_news(topics, lookback_hours, min(cap_per_topic, 3))  # Limit to 3 articles max
         
-        if not articles:
-            print("⚠️ No articles found, creating content with background context")
-            # Create a basic script with background context
-            script = f"Welcome to Noah. Here's your {duration}-minute briefing on {', '.join(topics)}. While we couldn't fetch the latest news at this time, here's some relevant background information. {', '.join(topics)} continue to be important topics in today's world. Stay tuned for more updates on these subjects. That concludes your Noah briefing. Stay informed and have a great day."
+        # Validate news quality
+        news_validation = validate_recent_news(articles, topics)
+        print(f"📊 News quality: {news_validation['quality_score']:.1f}% ({news_validation['recent_articles']}/{news_validation['total_articles']} recent articles)")
+        
+        if not articles or not news_validation["has_recent_news"]:
+            print("⚠️ No recent news found, creating no-news script")
+            script = create_no_recent_news_script(topics, duration, language)
             word_count = len(script.split())
         else:
-            print(f"📰 Found {len(articles)} articles")
+            print(f"📰 Found {len(articles)} relevant recent articles")
             
             # Step 2: Generate script with precision timing
             print("✍️ Generating news script with precision timing...")
@@ -506,7 +613,16 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
                 "mp3_name": audio_result['filename'],
                 "word_count": word_count,
                 "precision_timing": strict_timing,
-                "timing_quality": "exact" if duration_accuracy < 0.5 else "close" if duration_accuracy < 1.0 else "approximate"
+                "timing_quality": "exact" if duration_accuracy < 0.5 else "close" if duration_accuracy < 1.0 else "approximate",
+                "news_quality": {
+                    "quality_score": news_validation["quality_score"],
+                    "total_articles": news_validation["total_articles"],
+                    "recent_articles": news_validation["recent_articles"],
+                    "high_relevance_articles": news_validation["high_relevance_articles"],
+                    "topics_with_news": list(news_validation["topics_with_news"]),
+                    "topics_without_news": list(news_validation["topics_without_news"]),
+                    "has_recent_news": news_validation["has_recent_news"]
+                }
             }
         else:
             raise Exception(f"Audio generation failed: {audio_result['error']}")
@@ -517,3 +633,67 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
             "status": "error",
             "error": str(e)
         }
+
+def validate_recent_news(articles: List[Dict], topics: List[str]) -> Dict:
+    """Validate that we have recent, relevant news for the requested topics"""
+    validation = {
+        "has_recent_news": False,
+        "total_articles": len(articles),
+        "recent_articles": 0,
+        "high_relevance_articles": 0,
+        "topics_with_news": set(),
+        "topics_without_news": set(topics),
+        "quality_score": 0.0
+    }
+    
+    if not articles:
+        return validation
+    
+    for article in articles:
+        topic = article.get("topic", "")
+        relevance_score = article.get("relevance_score", 0)
+        
+        if topic in topics:
+            validation["topics_with_news"].add(topic)
+            validation["topics_without_news"].discard(topic)
+            
+            if relevance_score > 2.0:
+                validation["high_relevance_articles"] += 1
+            
+            if relevance_score > 1.0:
+                validation["recent_articles"] += 1
+    
+    # Calculate overall quality score
+    if validation["total_articles"] > 0:
+        validation["quality_score"] = (validation["recent_articles"] / validation["total_articles"]) * 100
+        validation["has_recent_news"] = validation["quality_score"] > 50
+    
+    return validation
+
+def create_no_recent_news_script(topics: List[str], duration_minutes: int, language: str) -> str:
+    """Create a script when no recent news is available"""
+    return f"""Good {get_time_greeting()}, I'm Noah with your {duration_minutes}-minute briefing on {', '.join(topics)}.
+
+I've checked for the latest developments on your requested topics, but I don't have any breaking news or recent updates to report at this time. This could mean:
+
+1. It's been a quiet period for these topics
+2. The news cycle is currently focused elsewhere
+3. Major developments may be brewing but haven't been announced yet
+
+I recommend checking back in a few hours for fresh updates, or you can request different topics that may have more recent activity.
+
+That concludes your briefing. Stay informed and have a great day."""
+
+def get_time_greeting() -> str:
+    """Get appropriate time-based greeting"""
+    from datetime import datetime
+    hour = datetime.now().hour
+    
+    if 5 <= hour < 12:
+        return "morning"
+    elif 12 <= hour < 17:
+        return "afternoon"
+    elif 17 <= hour < 21:
+        return "evening"
+    else:
+        return "evening"

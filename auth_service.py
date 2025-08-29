@@ -2,7 +2,7 @@
 import hashlib
 import secrets
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from models import User, Subscription, UserSession, SubscriptionTier
 
@@ -56,6 +56,10 @@ class AuthService:
         """Generate secure session token"""
         return secrets.token_urlsafe(32)
     
+    def _get_current_time(self) -> datetime:
+        """Get current UTC time"""
+        return datetime.now(timezone.utc)
+    
     def register_user(self, email: str, password: str) -> Dict[str, Any]:
         """Register a new user"""
         # Check if email already exists
@@ -71,7 +75,7 @@ class AuthService:
         subscription = Subscription(
             user_id=user.id,
             tier=SubscriptionTier.FREE,
-            start_date=datetime.utcnow()
+            start_date=self._get_current_time()
         )
         
         # Store user and subscription
@@ -108,7 +112,7 @@ class AuthService:
             return {"success": False, "error": "Account is deactivated"}
         
         # Update last login
-        user.last_login = datetime.utcnow()
+        user.last_login = self._get_current_time()
         
         # Create session
         session_token = self._generate_session_token()
@@ -134,10 +138,11 @@ class AuthService:
     
     def validate_session(self, session_token: str) -> Optional[User]:
         """Validate session token and return user if valid"""
+        current_time = self._get_current_time()
         for session in self.sessions.values():
             if (session.session_token == session_token and 
                 session.is_active and 
-                session.expires_at > datetime.utcnow()):
+                session.expires_at > current_time):
                 return self.users.get(session.user_id)
         return None
     
@@ -162,13 +167,13 @@ class AuthService:
         if current_sub:
             # Deactivate current subscription
             current_sub.is_active = False
-            current_sub.end_date = datetime.utcnow()
+            current_sub.end_date = self._get_current_time()
         
         # Create new premium subscription
         new_subscription = Subscription(
             user_id=user_id,
             tier=SubscriptionTier.PREMIUM,
-            start_date=datetime.utcnow()
+            start_date=self._get_current_time()
         )
         
         self.subscriptions[new_subscription.id] = new_subscription

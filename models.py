@@ -1,5 +1,5 @@
 # models.py - Data models for Daily Noah business system
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from enum import Enum
 import uuid
@@ -14,7 +14,7 @@ class User:
         self.email = email
         self.password_hash = password_hash
         self.subscription_tier = subscription_tier
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.last_login = None
         self.is_active = True
         self.preferences = {
@@ -63,8 +63,9 @@ class UserSession:
         self.id = str(uuid.uuid4())
         self.user_id = user_id
         self.session_token = session_token
-        self.created_at = datetime.utcnow()
-        self.expires_at = datetime.utcnow().replace(hour=datetime.utcnow().hour + 24)  # 24 hour expiry
+        self.created_at = datetime.now(timezone.utc)
+        # Fix: Use proper datetime arithmetic for 24-hour expiry
+        self.expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
         self.is_active = True
     
     def to_dict(self):

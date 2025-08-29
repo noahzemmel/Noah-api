@@ -149,12 +149,16 @@ async def generate_bulletin(
         # New precision timing parameter
         strict_timing = request.get("strict_timing", True)  # Default to precision timing
         
+        # Quick test mode for faster processing
+        quick_test = request.get("quick_test", False)
+        
         # Debug: Log extracted values
         print(f"DEBUG: Extracted topics: {topics}")
         print(f"DEBUG: Topics type: {type(topics)}")
         print(f"DEBUG: Topics length: {len(topics) if isinstance(topics, list) else 'Not a list'}")
         print(f"DEBUG: Duration: {duration} minutes")
         print(f"DEBUG: Strict timing: {strict_timing}")
+        print(f"DEBUG: Quick test mode: {quick_test}")
         
         # Better validation with detailed error messages
         if not topics:
@@ -184,7 +188,13 @@ async def generate_bulletin(
         lookback_hours = request.get("lookback_hours", 24)
         cap_per_topic = request.get("cap_per_topic", 5)
         
-        print(f"DEBUG: About to call make_noah_audio with topics: {topics}, duration: {duration}, strict_timing: {strict_timing}")
+        # Adjust parameters for quick test mode
+        if quick_test:
+            lookback_hours = min(lookback_hours, 12)  # Reduce lookback time
+            cap_per_topic = min(cap_per_topic, 2)     # Reduce articles per topic
+            print(f"DEBUG: Quick test mode enabled - reduced lookback: {lookback_hours}h, cap: {cap_per_topic}")
+        
+        print(f"DEBUG: About to call make_noah_audio with topics: {topics}, duration: {duration}, strict_timing: {strict_timing}, quick_test: {quick_test}")
         
         # Generate the bulletin
         result = make_noah_audio(

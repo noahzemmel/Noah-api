@@ -199,8 +199,8 @@ Format the response as a clean script ready for text-to-speech.
 
 def generate_script_with_precision(articles: List[Dict], topics: List[str], language: str, 
                                   target_duration_minutes: float, tone: str = "professional", 
-                                  voice_id: str = "21m00Tcm4TlvDq8ikWAM", max_iterations: int = 3):
-    """Generate news script with precision timing control"""
+                                  voice_id: str = "21m00Tcm4TlvDq8ikWAM", max_iterations: int = 2):
+    """Generate news script with precision timing control (optimized for speed)"""
     try:
         # Voice-specific timing adjustments (words per minute)
         voice_timing = {
@@ -216,11 +216,11 @@ def generate_script_with_precision(articles: List[Dict], topics: List[str], lang
         
         print(f"🎯 Target: {target_duration_minutes} minutes = {target_words} words (using {words_per_minute} wpm)")
         
-        # Prepare articles text
+        # Prepare articles text (limit content for faster processing)
         articles_text = ""
-        for article in articles:
+        for article in articles[:3]:  # Limit to 3 articles for speed
             title = article.get("title", "")
-            content = article.get("content", "")
+            content = article.get("content", "")[:500]  # Limit content length
             url = article.get("url", "")
             topic = article.get("topic", "")
             
@@ -229,11 +229,9 @@ def generate_script_with_precision(articles: List[Dict], topics: List[str], lang
         for iteration in range(max_iterations):
             print(f"🔄 Iteration {iteration + 1}: Targeting {target_words} words")
             
-            # Adjust prompt based on iteration
+            # Adjust prompt based on iteration (more aggressive for speed)
             if iteration == 0:
                 duration_instruction = f"Create a {target_duration_minutes}-minute news bulletin"
-            elif iteration == 1:
-                duration_instruction = f"Create a SHORTER news bulletin targeting exactly {target_duration_minutes} minutes"
             else:
                 duration_instruction = f"Create a MUCH SHORTER news bulletin - be very concise, target exactly {target_duration_minutes} minutes"
             
@@ -246,14 +244,13 @@ Available news articles:
 {articles_text}
 
 CRITICAL REQUIREMENTS:
-1. Target EXACTLY {target_words} words (±10 words)
+1. Target EXACTLY {target_words} words (±15 words)
 2. Create engaging, informative content
 3. Structure as a professional news bulletin
 4. Include brief introduction and conclusion
 5. Make it sound natural when spoken aloud
 6. Focus on the most important and recent news
-7. If there's not enough news, add relevant background context
-8. Be precise with word count - this is for exact timing control
+7. Be precise with word count - this is for exact timing control
 
 Current target: {target_words} words for {target_duration_minutes} minutes.
 
@@ -263,7 +260,7 @@ Format the response as a clean script ready for text-to-speech.
             response = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=4000,
+                max_tokens=2000,  # Reduced for speed
                 temperature=0.7
             )
             
@@ -272,16 +269,16 @@ Format the response as a clean script ready for text-to-speech.
             
             print(f"📝 Generated: {actual_words} words (target: {target_words})")
             
-            # Check if we're close enough
-            if abs(actual_words - target_words) <= 15:  # Allow 15 word tolerance
+            # Check if we're close enough (more lenient for speed)
+            if abs(actual_words - target_words) <= 20:  # Allow 20 word tolerance
                 print(f"✅ Word count within tolerance: {actual_words} vs {target_words}")
                 return script, actual_words
             
-            # Adjust target for next iteration
+            # Adjust target for next iteration (more aggressive)
             if actual_words > target_words:
-                target_words = int(target_words * 0.85)  # Reduce by 15%
+                target_words = int(target_words * 0.80)  # Reduce by 20%
             else:
-                target_words = int(target_words * 1.15)  # Increase by 15%
+                target_words = int(target_words * 1.20)  # Increase by 20%
         
         print(f"⚠️ Max iterations reached, using final script with {len(script.split())} words")
         return script, len(script.split())
@@ -448,9 +445,9 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
         print(f"🎙️ Creating {duration}-minute {language} bulletin on {', '.join(topics)}")
         print(f"🎯 Precision timing: {'ENABLED' if strict_timing else 'Standard'}")
         
-        # Step 1: Fetch news
+        # Step 1: Fetch news (limit for speed)
         print("📰 Fetching latest news...")
-        articles = fetch_news(topics, lookback_hours, cap_per_topic)
+        articles = fetch_news(topics, lookback_hours, min(cap_per_topic, 3))  # Limit to 3 articles max
         
         if not articles:
             print("⚠️ No articles found, creating content with background context")
@@ -463,9 +460,14 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
             # Step 2: Generate script with precision timing
             print("✍️ Generating news script with precision timing...")
             if strict_timing:
-                script, word_count = generate_script_with_precision(
-                    articles, topics, language, duration, tone, voice
-                )
+                try:
+                    script, word_count = generate_script_with_precision(
+                        articles, topics, language, duration, tone, voice
+                    )
+                except Exception as e:
+                    print(f"⚠️ Precision timing failed, falling back to standard: {e}")
+                    script = generate_script(articles, topics, language, duration, tone)
+                    word_count = len(script.split())
             else:
                 script = generate_script(articles, topics, language, duration, tone)
                 word_count = len(script.split())

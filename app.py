@@ -65,6 +65,10 @@ with st.sidebar:
     # Precision timing control
     strict_timing = st.checkbox("🎯 Enable Precision Timing", value=True, 
                                help="When enabled, Noah will generate bulletins that are exactly the requested duration (±30 seconds)")
+    
+    # Quick test mode
+    quick_test = st.checkbox("⚡ Quick Test Mode", value=False,
+                            help="Enable for faster testing with reduced content (may affect timing precision)")
 
     st.subheader("🎨 Tone")
     tone = st.selectbox("Tone", ["professional", "friendly", "casual", "formal"], index=0)
@@ -85,6 +89,14 @@ if run:
     try:
         status.info("🔄 Generating your news bulletin...")
         
+        # Show progress steps
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Step 1: Preparing request
+        status_text.info("📤 Preparing request...")
+        progress_bar.progress(10)
+        
         # Prepare payload for simplified API
         payload = {
             "topics": topics_list,
@@ -92,7 +104,8 @@ if run:
             "voice": voice_id,
             "duration": duration,
             "tone": tone,
-            "strict_timing": strict_timing
+            "strict_timing": strict_timing,
+            "quick_test": quick_test
         }
         
         # Debug: Show what we're sending
@@ -100,8 +113,16 @@ if run:
         st.info(f"🌐 Sending request to: {API_BASE}/generate")
         st.info(f"📤 Payload: {payload}")
         
+        # Step 2: Sending to API
+        status_text.info("📡 Sending to Noah API...")
+        progress_bar.progress(20)
+        
         # Call the API
-        response = requests.post(f"{API_BASE}/generate", json=payload, timeout=120)
+        response = requests.post(f"{API_BASE}/generate", json=payload, timeout=300)  # Increased to 5 minutes
+        
+        # Step 3: Processing response
+        status_text.info("📥 Processing response...")
+        progress_bar.progress(80)
         
         # Debug: Show response details
         st.info(f"📥 Response status: {response.status_code}")
@@ -111,6 +132,10 @@ if run:
         
         result = response.json()
         st.info(f"📥 Response body: {result}")
+        
+        # Step 4: Complete
+        progress_bar.progress(100)
+        status_text.success("✅ Processing complete!")
         
         if result.get("status") == "success":
             status.success("✅ Bulletin generated successfully!")

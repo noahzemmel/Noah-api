@@ -47,9 +47,8 @@ with st.sidebar:
     # Build options for selectbox
     def label(v: dict) -> str:
         name = v.get("name", "Unknown")
-        provider = v.get("provider", "")
         accent = v.get("accent", "")
-        return f"{name} ({provider})" + (f" - {accent}" if accent else "")
+        return f"{name}" + (f" - {accent}" if accent else "")
 
     selected_voice = st.selectbox(
         "Voice", 
@@ -89,14 +88,6 @@ if run:
     try:
         status.info("🔄 Generating your news bulletin...")
         
-        # Show progress steps
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Step 1: Preparing request
-        status_text.info("📤 Preparing request...")
-        progress_bar.progress(10)
-        
         # Prepare payload for simplified API
         payload = {
             "topics": topics_list,
@@ -108,48 +99,21 @@ if run:
             "quick_test": quick_test
         }
         
-        # Debug: Show what we're sending
-        st.json(payload)
-        st.info(f"🌐 Sending request to: {API_BASE}/generate")
-        st.info(f"📤 Payload: {payload}")
-        
-        # Step 2: Sending to API
-        status_text.info("📡 Sending to Noah API...")
-        progress_bar.progress(20)
-        
         # Call the API
         response = requests.post(f"{API_BASE}/generate", json=payload, timeout=300)  # Increased to 5 minutes
-        
-        # Step 3: Processing response
-        status_text.info("📥 Processing response...")
-        progress_bar.progress(80)
-        
-        # Debug: Show response details
-        st.info(f"📥 Response status: {response.status_code}")
-        st.info(f"📥 Response headers: {dict(response.headers)}")
         
         response.raise_for_status()
         
         result = response.json()
-        st.info(f"📥 Response body: {result}")
-        
-        # Step 4: Complete
-        progress_bar.progress(100)
-        status_text.success("✅ Processing complete!")
         
         if result.get("status") == "success":
             status.success("✅ Bulletin generated successfully!")
             
-            # Display results in columns
+            # Display results in a clean, focused layout
             col1, col2 = st.columns([1, 1])
             
             with col1:
-                st.subheader("📝 Transcript")
-                transcript = result.get("transcript", "")
-                st.text_area("Generated Content", transcript, height=300, disabled=True)
-            
-            with col2:
-                st.subheader("🎵 Audio")
+                st.subheader("🎵 Audio Player")
                 audio_url = result.get("audio_url", "")
                 if audio_url:
                     # Construct full URL
@@ -161,12 +125,41 @@ if run:
                         "⬇ Download MP3",
                         data=requests.get(full_audio_url, timeout=60).content,
                         file_name=result.get("mp3_name", "noah_bulletin.mp3"),
-                        mime="audio/mpeg"
+                        mime="audio/mpeg",
+                        use_container_width=True
                     )
                 else:
                     st.warning("No audio generated.")
-                
-                st.subheader("📊 Details")
+            
+            with col2:
+                st.subheader("📝 Transcript")
+                transcript = result.get("transcript", "")
+                st.text_area("Generated Content", transcript, height=300, disabled=True)
+            
+            # Article sources below
+            st.subheader("📰 Sources")
+            srcs = result.get("sources", [])
+            if not srcs:
+                st.info("No source articles available for this briefing.")
+            else:
+                st.write(f"**{len(srcs)} source articles used in this briefing:**")
+                for i, s in enumerate(srcs, 1):
+                    title = s.get("title", "")
+                    url = s.get("url", "")
+                    topic = s.get("topic", "")
+                    
+                    if title and url:
+                        # Create a clean display with topic, title, and link
+                        topic_display = f"**{topic}**" if topic else ""
+                        st.markdown(f"{i}. {topic_display} **{title}**")
+                        st.markdown(f"   [📖 Read Full Article]({url})")
+                    elif url:
+                        st.markdown(f"{i}. [📖 Read Article]({url})")
+                    else:
+                        st.write(f"{i}. Source information unavailable")
+            
+            # Show timing info in a subtle way
+            with st.expander("⏱️ Timing Details"):
                 st.write(f"**Target Duration:** {result.get('target_duration_minutes', 0):.1f} minutes")
                 st.write(f"**Actual Duration:** {result.get('duration_minutes', 0):.2f} minutes")
                 
@@ -180,15 +173,13 @@ if run:
                     st.warning(f"🎯 **Timing Accuracy:** APPROXIMATE (±{accuracy:.2f} minutes)")
                 
                 st.write(f"**Precision Timing:** {'✅ Enabled' if result.get('precision_timing', False) else '❌ Disabled'}")
-                st.write(f"**Topics:** {', '.join(result.get('topics', []))}")
-                st.write(f"**Language:** {result.get('language', 'Unknown')}")
-                st.write(f"**Voice:** {result.get('voice', 'Unknown')}")
                 st.write(f"**Word Count:** {result.get('word_count', 0)} words")
                 
                 # Show news quality information
                 news_quality = result.get('news_quality', {})
                 if news_quality:
-                    st.subheader("📰 News Quality")
+                    st.write("---")
+                    st.write("**📰 News Quality Information**")
                     quality_score = news_quality.get('quality_score', 0)
                     
                     if quality_score > 80:
@@ -221,18 +212,9 @@ if run:
     except requests.exceptions.HTTPError as e:
         error_detail = e.response.text if e.response else "No details"
         status.error(f"❌ API Error {e.response.status_code}: {error_detail}")
-        st.error(f"Full error: {error_detail}")
-        
-        # Debug: Show more error details
-        st.error(f"Request URL: {API_BASE}/generate")
-        st.error(f"Request payload: {payload}")
-        st.error(f"Response status: {e.response.status_code}")
-        st.error(f"Response text: {e.response.text}")
         
     except Exception as e:
         status.error(f"❌ Error: {str(e)}")
-        st.error(f"Exception: {str(e)}")
-        st.error(f"Exception type: {type(e)}")
 else:
     # Show instructions when not generating
     st.info("🎯 Enter your topics in the sidebar and click 'Generate Bulletin' to get started!")

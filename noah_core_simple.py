@@ -794,7 +794,8 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
                     "topics_with_news": list(news_validation["topics_with_news"]),
                     "topics_without_news": list(news_validation["topics_without_news"]),
                     "has_recent_news": news_validation["has_recent_news"]
-                }
+                },
+                "sources": articles  # Add the source articles for the frontend
             }
         else:
             raise Exception(f"Audio generation failed: {audio_result['error']}")

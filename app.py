@@ -1,12 +1,12 @@
-# app.py — Streamlit UI (safe voice dropdown + polling)
+# app.py — Streamlit UI for Noah MVP (Simplified API)
 import os, time, json, requests, streamlit as st
 
-# Configuration
-API_BASE = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
+# Configuration - Use the deployed backend URL
+API_BASE = os.getenv("API_BASE", "https://noah-api-t6wj.onrender.com").rstrip("/")
 
 st.set_page_config(page_title="Noah — Daily Smart Bulletins", layout="wide")
 
-st.title("Noah — Daily Smart Bulletins")
+st.title("🎙️ Noah — Daily Smart Bulletins")
 st.caption(f"Generated news & insights in **your language**, **your voice**, **your time**.\n\nAPI: {API_BASE}")
 
 @st.cache_data(ttl=3600)
@@ -19,123 +19,151 @@ def fetch_voices():
         if not voices:
             raise ValueError("empty voices")
         return voices
-    except Exception:
-        # Fallback; still works
+    except Exception as e:
+        st.error(f"Error fetching voices: {e}")
+        # Fallback voices
         return [
-            {"id": "", "name": "Use API default", "provider": "auto"},
-            {"id": "alloy", "name": "Alloy", "provider": "openai"},
+            {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel (Default)", "provider": "elevenlabs"},
         ]
 
 with st.sidebar:
-    st.subheader("Language")
-    language = st.selectbox("Language", ["English"], index=0)
+    st.subheader("🎯 Topics")
+    topics_input = st.text_area(
+        "Enter topics (one per line)", 
+        value="tech news\nAI developments", 
+        height=120, 
+        placeholder="Enter topics here...\nOne topic per line\nExample:\ntech news\nAI developments\nworld news"
+    )
+    
+    # Parse topics from text input
+    topics = [topic.strip() for topic in topics_input.split('\n') if topic.strip()]
+    
+    st.subheader("🌍 Language")
+    language = st.selectbox("Language", ["English", "Spanish", "French", "German", "Italian"], index=0)
 
-    st.subheader("Voice")
+    st.subheader("🎙️ Voice")
     voices = fetch_voices()
-
-    # Build options for selectbox and keep mapping to ids
+    
+    # Build options for selectbox
     def label(v: dict) -> str:
-        if not v.get("id"):
-            return v.get("name", "Use API default")
-        p = v.get("provider", "")
-        return f"{v.get('name','Voice')}" + (f" ({p})" if p else "")
+        name = v.get("name", "Unknown")
+        provider = v.get("provider", "")
+        accent = v.get("accent", "")
+        return f"{name} ({provider})" + (f" - {accent}" if accent else "")
 
     selected_voice = st.selectbox(
-        "Voice", options=voices, index=0,
+        "Voice", 
+        options=voices, 
+        index=0,
         format_func=label,
     )
-    voice_id = (selected_voice or {}).get("id", "")
+    voice_id = selected_voice.get("id", "21m00Tcm4TlvDq8ikWAM")
 
-    st.subheader("Topics / queries (one per line)")
-    topics = st.text_area("Topics", value="world news\nAI research", height=140, label_visibility="collapsed")
+    st.subheader("⏱️ Duration")
+    duration = st.slider("Duration (minutes)", 1, 15, 5)
 
-    st.subheader("Exact length (minutes)")
-    minutes = st.slider("Exact minutes", 2, 30, 8)
+    st.subheader("🎨 Tone")
+    tone = st.selectbox("Tone", ["professional", "friendly", "casual", "formal"], index=0)
 
-    st.subheader("Tone")
-    tone = st.selectbox("Tone", ["confident and crisp", "warm and friendly", "neutral"], index=0)
+    run = st.button("🚀 Generate Bulletin", use_container_width=True, type="primary")
 
-    st.subheader("How far back to look (hours)")
-    lookback = st.slider("Lookback", 6, 72, 24)
-
-    st.subheader("Maximum stories per topic")
-    cap = st.slider("Cap per topic", 2, 8, 6)
-
-    strict = st.toggle("Strict timing (playback adjusted to exact length)", value=False)
-
-    run = st.button("🚀 Generate Noah", use_container_width=True)
-
+# Main content area
 status = st.empty()
-col1, col2, col3 = st.columns([1,1,1])
-
-def call_api(payload: dict):
-    r = requests.post(f"{API_BASE}/generate", json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-def poll(job_id: str, max_wait=900, delay=2.5):
-    t0 = time.time()
-    while True:
-        r = requests.get(f"{API_BASE}/result/{job_id}", timeout=30)
-        if r.status_code == 404:
-            return {"status": "error", "error": "job not found"}
-        data = r.json()
-        s = data.get("status")
-        logs = "\n".join(data.get("logs", []))
-        status.markdown(f"**Contacting Noah API…**\n\n**Started job:** `{job_id}`\n\n```\n{logs}\n```")
-        if s in ("done", "error"):
-            return data
-        if time.time() - t0 > max_wait:
-            return {"status": "error", "error": "Timeout waiting for API result.", "logs": data.get("logs", [])}
-        time.sleep(delay)
 
 if run:
-    payload = {
-        "queries": topics,
-        "language": language,
-        "tone": tone,
-        "recent_hours": lookback,
-        "cap_per_query": cap,
-        "min_minutes": minutes,
-        "exact_minutes": True,
-        "voice_id": voice_id or None,
-    }
+    # Parse topics from the input (do this when button is clicked)
+    topics_list = [topic.strip() for topic in topics_input.split('\n') if topic.strip()]
+    
+    if not topics_list:
+        status.error("❌ Please enter at least one topic to generate a bulletin.")
+        st.stop()
+    
     try:
-        status.info("Submitting job…")
-        start = call_api(payload)
-        job_id = start.get("job_id")
-        if not job_id:
-            status.error(f"API error: {start}")
+        status.info("🔄 Generating your news bulletin...")
+        
+        # Prepare payload for simplified API
+        payload = {
+            "topics": topics_list,
+            "language": language,
+            "voice": voice_id,
+            "duration": duration,
+            "tone": tone
+        }
+        
+        # Debug: Show what we're sending
+        st.json(payload)
+        st.info(f"🌐 Sending request to: {API_BASE}/generate")
+        st.info(f"📤 Payload: {payload}")
+        
+        # Call the API
+        response = requests.post(f"{API_BASE}/generate", json=payload, timeout=120)
+        
+        # Debug: Show response details
+        st.info(f"📥 Response status: {response.status_code}")
+        st.info(f"📥 Response headers: {dict(response.headers)}")
+        
+        response.raise_for_status()
+        
+        result = response.json()
+        st.info(f"📥 Response body: {result}")
+        
+        if result.get("status") == "success":
+            status.success("✅ Bulletin generated successfully!")
+            
+            # Display results in columns
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("📝 Transcript")
+                transcript = result.get("transcript", "")
+                st.text_area("Generated Content", transcript, height=300, disabled=True)
+            
+            with col2:
+                st.subheader("🎵 Audio")
+                audio_url = result.get("audio_url", "")
+                if audio_url:
+                    # Construct full URL
+                    full_audio_url = f"{API_BASE}{audio_url}"
+                    st.audio(full_audio_url, format="audio/mpeg")
+                    
+                    # Download button
+                    st.download_button(
+                        "⬇ Download MP3",
+                        data=requests.get(full_audio_url, timeout=60).content,
+                        file_name=result.get("mp3_name", "noah_bulletin.mp3"),
+                        mime="audio/mpeg"
+                    )
+                else:
+                    st.warning("No audio generated.")
+                
+                st.subheader("📊 Details")
+                st.write(f"**Duration:** {result.get('duration_minutes', 0):.1f} minutes")
+                st.write(f"**Topics:** {', '.join(result.get('topics', []))}")
+                st.write(f"**Language:** {result.get('language', 'Unknown')}")
+                st.write(f"**Voice:** {result.get('voice', 'Unknown')}")
+        
         else:
-            data = poll(job_id)
-            if data.get("status") == "done" and data.get("result"):
-                res = data["result"]
-                with col1:
-                    st.subheader("Bullet points")
-                    st.write("\n".join(f"- {b}" for b in res.get("bullets", [])) or "_none_")
-                with col2:
-                    st.subheader("Your briefing")
-                    st.caption(f"Target: {res.get('target_minutes')} min • Actual: {res.get('actual_minutes')} min • Playback rate: {res.get('playback_rate')}")
-                    mp3 = res.get("mp3_url")
-                    if mp3:
-                        st.audio(mp3, format="audio/mp3")
-                        st.download_button("⬇ Download MP3", data=requests.get(mp3, timeout=60).content, file_name=res.get("mp3_name","noah.mp3"))
-                    else:
-                        st.warning("No audio returned.")
-                with col3:
-                    st.subheader("Sources used")
-                    srcs = res.get("sources", [])
-                    if not srcs:
-                        st.write("_none_")
-                    else:
-                        for s in srcs:
-                            title = s.get("title") or s.get("url","")
-                            u = s.get("url","")
-                            st.markdown(f"- **{title}**<br/>[{u}]({u})", unsafe_allow_html=True)
-                status.success("Done ✓")
-            else:
-                status.error(f"API error: {data.get('error','Unknown error')}")
-    except requests.HTTPError as e:
-        status.error(f"API {e.response.status_code}: {e.response.text[:400]}")
+            status.error(f"❌ Error: {result.get('error', 'Unknown error')}")
+            
+    except requests.exceptions.HTTPError as e:
+        error_detail = e.response.text if e.response else "No details"
+        status.error(f"❌ API Error {e.response.status_code}: {error_detail}")
+        st.error(f"Full error: {error_detail}")
+        
+        # Debug: Show more error details
+        st.error(f"Request URL: {API_BASE}/generate")
+        st.error(f"Request payload: {payload}")
+        st.error(f"Response status: {e.response.status_code}")
+        st.error(f"Response text: {e.response.text}")
+        
     except Exception as e:
-        status.error(f"Client error: {e}")
+        status.error(f"❌ Error: {str(e)}")
+        st.error(f"Exception: {str(e)}")
+        st.error(f"Exception type: {type(e)}")
+else:
+    # Show instructions when not generating
+    st.info("🎯 Enter your topics in the sidebar and click 'Generate Bulletin' to get started!")
+
+# Footer
+st.markdown("---")
+st.caption("🎙️ Noah MVP - AI-powered news bulletins | Built with FastAPI, Streamlit, OpenAI, and ElevenLabs")

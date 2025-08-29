@@ -1,7 +1,8 @@
 # app.py — Streamlit UI (safe voice dropdown + polling)
 import os, time, json, requests, streamlit as st
 
-API_BASE = os.getenv("API_BASE", "https://thenoah.onrender.com").rstrip("/")
+# Configuration
+API_BASE = os.getenv("API_BASE", "http://localhost:8000").rstrip("/")
 
 st.set_page_config(page_title="Noah — Daily Smart Bulletins", layout="wide")
 

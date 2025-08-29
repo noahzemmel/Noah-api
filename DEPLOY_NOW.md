@@ -6,6 +6,7 @@
 - [x] Full workflow tested (news → GPT-4 → TTS → MP3)
 - [x] Environment variables configured
 - [x] Code ready for production
+- [x] **FIXED**: Python 3.13 compatibility issues
 
 ## 🌐 **Deploy to Render - Step by Step**
 
@@ -17,7 +18,7 @@
 - Click **"New +"** → **"Web Service"**
 - **Connect your GitHub repository**: `noah-mvp`
 - **Name**: `noah-api` (or your preferred name)
-- **Environment**: `Python 3`
+- **Environment**: `Python 3` (will use Python 3.11 from runtime.txt)
 - **Build Command**: `pip install -r requirements.txt`
 - **Start Command**: `uvicorn server:app --host 0.0.0.0 --port $PORT`
 - **Plan**: `Starter` (free tier)
@@ -71,6 +72,19 @@ If you want the frontend on Render too:
 - **Start Command**: `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`
 - **Environment Variables**: Only need `API_BASE` pointing to your backend
 
+## 🔧 **What We Fixed**
+
+### **Python 3.13 Compatibility**
+- ✅ Added `runtime.txt` to force Python 3.11
+- ✅ Updated `requirements.txt` for better compatibility
+- ✅ Fixed `pydub` dependency issues
+- ✅ Updated Dockerfile for Render deployment
+
+### **Dependencies**
+- ✅ All packages compatible with Render's environment
+- ✅ Proper system dependencies (ffmpeg, etc.)
+- ✅ Clean, organized requirements
+
 ## 🎯 **What You'll Get**
 
 ### **Backend API**
@@ -117,6 +131,7 @@ Your Noah MVP will be fully functional with:
 - ✅ Beautiful web interface
 - ✅ MP3 downloads
 - ✅ Production-ready deployment
+- ✅ **Fixed Python 3.13 compatibility**
 
 ## 🆘 **Need Help?**
 
@@ -125,6 +140,7 @@ If anything goes wrong:
 2. Verify environment variables
 3. Test API endpoints individually
 4. Check the health endpoint
+5. **The Python 3.13 issue is now fixed!**
 
 ---
 

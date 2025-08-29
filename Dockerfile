@@ -1,4 +1,4 @@
-# Dockerfile (API service)
+# Dockerfile (API service) - Python 3.11 for compatibility
 FROM python:3.11-slim
 
 # System deps
@@ -8,10 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 COPY noah_core.py server.py ./
+
+# Create audio directory
+RUN mkdir -p audio
 
 # Render injects PORT
 ENV PORT=8080

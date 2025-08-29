@@ -81,6 +81,71 @@ async def debug_openai():
             "api_key_length": len(os.getenv("OPENAI_API_KEY", ""))
         }
 
+# Test timing precision endpoint
+@app.post("/test-timing-precision")
+async def test_timing_precision(request: Dict = Body(...)):
+    """Test endpoint specifically for timing precision validation"""
+    try:
+        topics = request.get("topics", ["tech news"])
+        duration = request.get("duration", 3)
+        voice = request.get("voice", "21m00Tcm4TlvDq8ikWAM")
+        strict_timing = request.get("strict_timing", True)
+        
+        print(f"🧪 Testing timing precision: {duration} minutes, strict: {strict_timing}")
+        
+        # Generate with strict timing
+        result = make_noah_audio(
+            topics=topics,
+            language="English",
+            voice=voice,
+            duration=duration,
+            tone="professional",
+            strict_timing=strict_timing
+        )
+        
+        if result.get("status") == "success":
+            actual_duration = result.get("duration_minutes", 0)
+            target_duration = result.get("target_duration_minutes", duration)
+            accuracy = result.get("duration_accuracy_minutes", 0)
+            word_count = result.get("word_count", 0)
+            
+            # Calculate timing performance
+            timing_performance = {
+                "requested_minutes": duration,
+                "actual_minutes": actual_duration,
+                "accuracy_minutes": accuracy,
+                "accuracy_percentage": abs(accuracy / duration * 100) if duration > 0 else 0,
+                "word_count": word_count,
+                "expected_words": int(duration * 140),  # Assuming 140 wpm
+                "word_count_accuracy": abs(word_count - int(duration * 140)) / int(duration * 140) * 100 if duration > 0 else 0,
+                "timing_quality": result.get("timing_quality", "unknown"),
+                "precision_timing": result.get("precision_timing", False)
+            }
+            
+            return {
+                "test_type": "timing_precision",
+                "requested_duration": duration,
+                "strict_timing": strict_timing,
+                "result": result,
+                "timing_performance": timing_performance,
+                "success": True
+            }
+        else:
+            return {
+                "test_type": "timing_precision",
+                "requested_duration": duration,
+                "strict_timing": strict_timing,
+                "result": result,
+                "success": False
+            }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "test_type": "timing_precision",
+            "success": False
+        }
+
 # Test precision timing endpoint
 @app.post("/test-timing")
 async def test_timing(request: Dict = Body(...)):

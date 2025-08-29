@@ -343,7 +343,7 @@ Available news articles (ranked by relevance and recency):
 {articles_text}
 
 CRITICAL REQUIREMENTS:
-1. Target EXACTLY {target_words} words (±15 words)
+1. Target EXACTLY {target_words} words (±10 words) - THIS IS CRITICAL FOR TIMING
 2. Focus on SPECIFIC developments, announcements, and breaking news from the last 24 hours
 3. Avoid generic overviews, explanations, or background information
 4. Lead with the most recent and relevant updates first
@@ -354,11 +354,20 @@ CRITICAL REQUIREMENTS:
 9. Each update should be actionable and informative
 10. Be precise with word count - this is for exact timing control
 
+CONTENT EXPANSION STRATEGIES (when news is limited):
+- Add detailed analysis of each development
+- Include "why this matters" explanations
+- Connect developments to broader industry trends
+- Add relevant context and implications
+- Explain potential future impacts
+- Include expert opinions or market reactions
+- Provide historical context when relevant
+
 Current target: {target_words} words for {target_duration_minutes} minutes.
 
 Format: Start with "Good [time], I'm Noah with your {target_duration_minutes}-minute briefing on [topics]." Then deliver specific updates, ending with "That concludes your briefing. Stay informed."
 
-Focus on WHAT HAPPENED, not what things are.
+Focus on WHAT HAPPENED, not what things are. If you have limited news, expand on what you have rather than adding generic content.
 """
 
             response = client.chat.completions.create(
@@ -390,6 +399,143 @@ Focus on WHAT HAPPENED, not what things are.
     except Exception as e:
         print(f"Error generating script with precision: {e}")
         return f"Welcome to Noah. Here's your {target_duration_minutes}-minute briefing on {', '.join(topics)}. Unfortunately, there was an error generating the content. Please try again later.", 0
+
+def expand_content_for_duration(script: str, target_duration_minutes: float, voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> str:
+    """Expand content to fill the requested duration when news is limited"""
+    try:
+        # Voice-specific timing adjustments (words per minute)
+        voice_timing = {
+            "21m00Tcm4TlvDq8ikWAM": 140,  # Rachel - measured
+            "2EiwWnXFnvU5JabPnv8n": 135,  # Clyde - measured
+            "CwhRBWXzGAHq8TQ4Fs17": 145,  # Roger - measured
+            "EXAVITQu4vr4xnSDxMaL": 138,  # Sarah - measured
+            "default": 140
+        }
+        
+        words_per_minute = voice_timing.get(voice_id, voice_timing["default"])
+        target_words = int(target_duration_minutes * words_per_minute)
+        current_words = len(script.split())
+        
+        print(f"📏 Content expansion: {current_words} words → {target_words} words (target: {target_duration_minutes} min)")
+        
+        if current_words >= target_words * 0.9:  # Within 10% of target
+            print(f"✅ Content already close to target, no expansion needed")
+            return script
+        
+        # Calculate how much we need to expand
+        expansion_factor = target_words / current_words if current_words > 0 else 2.0
+        expansion_factor = min(expansion_factor, 3.0)  # Cap at 3x to maintain quality
+        
+        print(f"🔄 Expansion factor: {expansion_factor:.2f}x")
+        
+        # Create expansion prompt
+        expansion_prompt = f"""
+The following is a {current_words}-word news briefing that needs to be expanded to approximately {target_words} words to fill a {target_duration_minutes}-minute duration.
+
+Current script:
+{script}
+
+EXPANSION REQUIREMENTS:
+1. Expand to approximately {target_words} words (±5% tolerance)
+2. Add more detail, context, and analysis to existing points
+3. Include relevant background information and implications
+4. Maintain the same professional tone and structure
+5. Keep the same introduction and conclusion format
+6. Make it sound natural when spoken aloud
+7. Focus on depth rather than adding new topics
+
+EXPANSION STRATEGIES:
+- Add "why this matters" explanations
+- Include relevant statistics and data
+- Explain broader implications and context
+- Add expert opinions or industry reactions
+- Connect dots between different developments
+- Provide historical context when relevant
+
+Target: {target_words} words for {target_duration_minutes} minutes.
+"""
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": expansion_prompt}],
+            max_tokens=3000,
+            temperature=0.6
+        )
+        
+        expanded_script = response.choices[0].message.content.strip()
+        expanded_words = len(expanded_script.split())
+        
+        print(f"📝 Expanded: {current_words} → {expanded_words} words (target: {target_words})")
+        
+        # If still too short, do one more expansion
+        if expanded_words < target_words * 0.85:
+            print(f"🔄 Second expansion needed: {expanded_words} → {target_words} words")
+            second_expansion_prompt = f"""
+The following expanded script is still too short. It needs to be {target_words} words for a {target_duration_minutes}-minute briefing.
+
+Current expanded script ({expanded_words} words):
+{expanded_script}
+
+FURTHER EXPANSION NEEDED:
+- Current: {expanded_words} words
+- Target: {target_words} words
+- Need: {target_words - expanded_words} more words
+
+Add more depth, analysis, and context to reach the target word count while maintaining quality and natural flow.
+"""
+
+            second_response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": second_expansion_prompt}],
+                max_tokens=4000,
+                temperature=0.6
+            )
+            
+            final_script = second_response.choices[0].message.content.strip()
+            final_words = len(final_script.split())
+            print(f"📝 Final expansion: {expanded_words} → {final_words} words (target: {target_words})")
+            return final_script
+        
+        return expanded_script
+        
+    except Exception as e:
+        print(f"⚠️ Content expansion failed: {e}, returning original script")
+        return script
+
+def validate_and_expand_content(script: str, target_duration_minutes: float, voice_id: str, 
+                              articles: List[Dict], topics: List[str]) -> tuple[str, int]:
+    """Validate content length and expand if needed to meet duration target"""
+    voice_timing = {
+        "21m00Tcm4TlvDq8ikWAM": 140,  # Rachel - measured
+        "2EiwWnXFnvU5JabPnv8n": 135,  # Clyde - measured
+        "CwhRBWXzGAHq8TQ4Fs17": 145,  # Roger - measured
+        "EXAVITQu4vr4xnSDxMaL": 138,  # Sarah - measured
+        "default": 140
+    }
+    
+    words_per_minute = voice_timing.get(voice_id, voice_timing["default"])
+    target_words = int(target_duration_minutes * words_per_minute)
+    current_words = len(script.split())
+    
+    print(f"📏 Content validation: {current_words} words, target: {target_words} words ({target_duration_minutes} min)")
+    
+    # Check if content is too short
+    if current_words < target_words * 0.8:  # More than 20% short
+        print(f"⚠️ Content too short ({current_words}/{target_words} words), expanding...")
+        
+        # If we have limited articles, expand the content
+        if len(articles) <= 2:
+            print(f"📰 Limited articles ({len(articles)}), expanding content depth")
+            expanded_script = expand_content_for_duration(script, target_duration_minutes, voice_id)
+            return expanded_script, len(expanded_script.split())
+        
+        # If we have more articles but content is still short, try to get more news
+        elif current_words < target_words * 0.6:  # More than 40% short
+            print(f"📰 Content very short ({current_words}/{target_words} words), expanding content depth")
+            expanded_script = expand_content_for_duration(script, target_duration_minutes, voice_id)
+            return expanded_script, len(expanded_script.split())
+    
+    return script, current_words
 
 def measure_audio_duration(audio_filepath: str) -> float:
     """Measure actual audio duration using ffprobe or file size estimation"""
@@ -578,6 +724,10 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
             else:
                 script = generate_script(articles, topics, language, duration, tone)
                 word_count = len(script.split())
+            
+            # Step 2.5: Validate and expand content if needed for timing
+            print("📏 Validating content length and expanding if needed...")
+            script, word_count = validate_and_expand_content(script, duration, voice, articles, topics)
         
         # Step 3: Generate audio with timing measurement
         print("🎵 Generating audio with duration measurement...")
@@ -594,6 +744,28 @@ def make_noah_audio(topics: List[str], language: str = "English", voice: str = N
                 actual_duration = audio_result["actual_duration_minutes"]
                 duration_accuracy = audio_result.get("duration_accuracy", 0)
                 print(f"🎯 Duration: {actual_duration:.2f} minutes (target: {duration}, accuracy: ±{duration_accuracy:.2f} min)")
+                
+                # Validate timing accuracy
+                if abs(actual_duration - duration) > 0.5:  # More than 30 seconds off
+                    print(f"⚠️ TIMING WARNING: Requested {duration} min, got {actual_duration:.2f} min (off by {abs(actual_duration - duration):.2f} min)")
+                    
+                    # If way off, try to regenerate with more aggressive expansion
+                    if abs(actual_duration - duration) > 1.0:  # More than 1 minute off
+                        print(f"🔄 Major timing miss detected, attempting content regeneration...")
+                        try:
+                            # Regenerate with more aggressive expansion
+                            if len(articles) > 0:
+                                expanded_script = expand_content_for_duration(script, duration, voice)
+                                new_word_count = len(expanded_script.split())
+                                print(f"📝 Regenerated: {word_count} → {new_word_count} words")
+                                
+                                # Only use if significantly longer
+                                if new_word_count > word_count * 1.3:
+                                    script = expanded_script
+                                    word_count = new_word_count
+                                    print(f"✅ Using expanded script for better timing")
+                        except Exception as e:
+                            print(f"⚠️ Content regeneration failed: {e}")
             else:
                 # Fallback estimation
                 actual_duration = word_count / 140  # Rough estimate

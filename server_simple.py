@@ -391,6 +391,10 @@ def make_noah_audio_with_progress(topics, language, voice, duration, tone, lookb
         from noah_core_simple import generate_audio_with_timing
         audio_result = generate_audio_with_timing(script, voice, duration)
         
+        # Check if audio generation was successful
+        if not audio_result.get("success", False):
+            raise Exception(f"Audio generation failed: {audio_result.get('error', 'Unknown error')}")
+        
         # Update progress: Audio generated
         progress_storage[progress_id].update({
             "progress_percent": 90,
@@ -402,7 +406,7 @@ def make_noah_audio_with_progress(topics, language, voice, duration, tone, lookb
             "status": "success",
             "transcript": script,
             "audio_url": f"/download/{audio_result['filename']}",
-            "duration_minutes": audio_result.get('duration_minutes', duration),
+            "duration_minutes": audio_result.get('actual_duration_minutes', duration),
             "target_duration_minutes": duration,
             "topics": topics,
             "language": language,

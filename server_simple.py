@@ -304,27 +304,44 @@ async def generate_bulletin(
             "current_step": "Fetching latest news..."
         })
         
-        # Generate the bulletin with progress tracking
-        result = make_noah_audio_with_progress(
-            topics=topics,
-            language=language,
-            voice=voice,
-            duration=duration,
-            tone=tone,
-            lookback_hours=lookback_hours,
-            cap_per_topic=cap_per_topic,
-            strict_timing=strict_timing,
-            progress_id=progress_id
-        )
+        # Start generation in background thread
+        import threading
+        def generate_in_background():
+            try:
+                result = make_noah_audio_with_progress(
+                    topics=topics,
+                    language=language,
+                    voice=voice,
+                    duration=duration,
+                    tone=tone,
+                    lookback_hours=lookback_hours,
+                    cap_per_topic=cap_per_topic,
+                    strict_timing=strict_timing,
+                    progress_id=progress_id
+                )
+                
+                # Store the final result
+                progress_storage[progress_id]["result"] = result
+                progress_storage[progress_id]["status"] = "completed"
+                progress_storage[progress_id]["progress_percent"] = 100
+                progress_storage[progress_id]["current_step"] = "Bulletin ready!"
+                
+            except Exception as e:
+                progress_storage[progress_id]["status"] = "error"
+                progress_storage[progress_id]["error"] = str(e)
+                progress_storage[progress_id]["current_step"] = f"Error: {str(e)}"
         
-        # Clean up progress tracking
-        if progress_id in progress_storage:
-            del progress_storage[progress_id]
+        # Start background thread
+        thread = threading.Thread(target=generate_in_background)
+        thread.daemon = True
+        thread.start()
         
-        if result.get("status") == "success":
-            return result
-        else:
-            raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+        # Return progress_id immediately so frontend can start tracking
+        return {
+            "status": "started",
+            "progress_id": progress_id,
+            "message": "Generation started, use progress_id to track progress"
+        }
             
     except HTTPException:
         # Clean up progress tracking on HTTP error
@@ -412,6 +429,37 @@ def make_noah_audio_with_progress(topics, language, voice, duration, tone, lookb
             "current_step": f"Error: {str(e)}"
         })
         raise e
+
+# Get final result endpoint
+@app.get("/result/{progress_id}")
+async def get_result(progress_id: str):
+    """Get the final result of a generation request"""
+    if progress_id not in progress_storage:
+        raise HTTPException(status_code=404, detail="Progress not found")
+    
+    progress = progress_storage[progress_id]
+    
+    if progress["status"] == "completed":
+        # Return the final result
+        result = progress.get("result")
+        if result:
+            # Clean up progress tracking
+            del progress_storage[progress_id]
+            return result
+        else:
+            raise HTTPException(status_code=500, detail="Result not available")
+    elif progress["status"] == "error":
+        error = progress.get("error", "Unknown error")
+        # Clean up progress tracking
+        del progress_storage[progress_id]
+        raise HTTPException(status_code=500, detail=error)
+    else:
+        # Still in progress
+        return {
+            "status": "in_progress",
+            "progress_percent": progress.get("progress_percent", 0),
+            "current_step": progress.get("current_step", "Processing...")
+        }
 
 # Download audio file
 @app.get("/download/{name}")

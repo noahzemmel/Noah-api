@@ -1,10 +1,12 @@
 # server_simple.py - FastAPI backend for Noah MVP (Python 3.13 compatible)
 import os
+import time
+import uuid
 from pathlib import Path
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import requests
 from dotenv import load_dotenv
 
@@ -12,6 +14,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from noah_core_simple import make_noah_audio, health_check, get_available_voices
+
+# Progress tracking storage
+progress_storage: Dict[str, Dict[str, Any]] = {}
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -44,6 +49,24 @@ async def voices():
         return voices_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching voices: {str(e)}")
+
+# Progress tracking endpoint
+@app.get("/progress/{progress_id}")
+async def get_progress(progress_id: str):
+    """Get current progress for a generation request"""
+    if progress_id not in progress_storage:
+        raise HTTPException(status_code=404, detail="Progress not found")
+    
+    progress = progress_storage[progress_id]
+    
+    # Calculate estimated time remaining
+    if progress["status"] == "in_progress":
+        elapsed = time.time() - progress["start_time"]
+        if progress["progress_percent"] > 0:
+            total_estimated = elapsed / (progress["progress_percent"] / 100)
+            progress["estimated_time_remaining"] = max(0, int(total_estimated - elapsed))
+    
+    return progress
 
 # Debug endpoint to test OpenAI API key
 @app.get("/debug/openai")
@@ -197,8 +220,21 @@ async def test_endpoint(request: Dict = Body(...)):
 async def generate_bulletin(
     request: Dict = Body(...)
 ):
-    """Generate a news bulletin with audio"""
+    """Generate a news bulletin with audio and progress tracking"""
     try:
+        # Create progress tracking ID
+        progress_id = str(uuid.uuid4())
+        
+        # Initialize progress
+        progress_storage[progress_id] = {
+            "status": "starting",
+            "progress_percent": 0,
+            "current_step": "Initializing...",
+            "estimated_time_remaining": request.get("duration", 5) * 15,  # Rough estimate
+            "start_time": time.time(),
+            "error": None
+        }
+        
         # Debug: Log the entire request
         print(f"DEBUG: Received request: {request}")
         print(f"DEBUG: Request type: {type(request)}")
@@ -261,8 +297,15 @@ async def generate_bulletin(
         
         print(f"DEBUG: About to call make_noah_audio with topics: {topics}, duration: {duration}, strict_timing: {strict_timing}, quick_test: {quick_test}")
         
-        # Generate the bulletin
-        result = make_noah_audio(
+        # Update progress: Starting generation
+        progress_storage[progress_id].update({
+            "status": "in_progress",
+            "progress_percent": 10,
+            "current_step": "Fetching latest news..."
+        })
+        
+        # Generate the bulletin with progress tracking
+        result = make_noah_audio_with_progress(
             topics=topics,
             language=language,
             voice=voice,
@@ -270,8 +313,13 @@ async def generate_bulletin(
             tone=tone,
             lookback_hours=lookback_hours,
             cap_per_topic=cap_per_topic,
-            strict_timing=strict_timing
+            strict_timing=strict_timing,
+            progress_id=progress_id
         )
+        
+        # Clean up progress tracking
+        if progress_id in progress_storage:
+            del progress_storage[progress_id]
         
         if result.get("status") == "success":
             return result
@@ -279,10 +327,91 @@ async def generate_bulletin(
             raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
             
     except HTTPException:
+        # Clean up progress tracking on HTTP error
+        if progress_id in progress_storage:
+            del progress_storage[progress_id]
         raise
     except Exception as e:
+        # Clean up progress tracking on error
+        if progress_id in progress_storage:
+            progress_storage[progress_id]["status"] = "error"
+            progress_storage[progress_id]["error"] = str(e)
         print(f"DEBUG: Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating bulletin: {str(e)}")
+
+def make_noah_audio_with_progress(topics, language, voice, duration, tone, lookback_hours, cap_per_topic, strict_timing, progress_id):
+    """Generate audio with progress tracking"""
+    try:
+        # Update progress: Fetching news
+        progress_storage[progress_id].update({
+            "progress_percent": 20,
+            "current_step": "Fetching latest news..."
+        })
+        
+        # Fetch news
+        from noah_core_simple import fetch_news
+        articles = fetch_news(topics, lookback_hours=lookback_hours, cap_per_topic=cap_per_topic)
+        
+        # Update progress: News fetched
+        progress_storage[progress_id].update({
+            "progress_percent": 40,
+            "current_step": f"Found {len(articles)} articles, generating script..."
+        })
+        
+        # Generate script
+        from noah_core_simple import generate_script_with_precision
+        script, word_count = generate_script_with_precision(
+            articles, topics, language, duration, tone, voice
+        )
+        
+        # Update progress: Script generated
+        progress_storage[progress_id].update({
+            "progress_percent": 70,
+            "current_step": f"Script ready ({word_count} words), generating audio..."
+        })
+        
+        # Generate audio
+        from noah_core_simple import generate_audio_with_timing
+        audio_result = generate_audio_with_timing(script, voice, duration)
+        
+        # Update progress: Audio generated
+        progress_storage[progress_id].update({
+            "progress_percent": 90,
+            "current_step": "Finalizing bulletin..."
+        })
+        
+        # Finalize result
+        result = {
+            "status": "success",
+            "transcript": script,
+            "audio_url": f"/download/{audio_result['filename']}",
+            "duration_minutes": audio_result.get('duration_minutes', duration),
+            "target_duration_minutes": duration,
+            "topics": topics,
+            "language": language,
+            "voice": voice,
+            "mp3_name": audio_result['filename'],
+            "word_count": word_count,
+            "sources": articles
+        }
+        
+        # Update progress: Complete
+        progress_storage[progress_id].update({
+            "status": "completed",
+            "progress_percent": 100,
+            "current_step": "Bulletin ready!"
+        })
+        
+        return result
+        
+    except Exception as e:
+        # Update progress: Error
+        progress_storage[progress_id].update({
+            "status": "error",
+            "error": str(e),
+            "current_step": f"Error: {str(e)}"
+        })
+        raise e
 
 # Download audio file
 @app.get("/download/{name}")

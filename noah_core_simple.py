@@ -296,8 +296,8 @@ Focus on WHAT HAPPENED, not what things are.
 
 def generate_script_with_precision(articles: List[Dict], topics: List[str], language: str, 
                                   target_duration_minutes: float, tone: str = "professional", 
-                                  voice_id: str = "21m00Tcm4TlvDq8ikWAM", max_iterations: int = 2):
-    """Generate news script with precision timing control (optimized for speed)"""
+                                  voice_id: str = "21m00Tcm4TlvDq8ikWAM", max_iterations: int = 1):
+    """Generate news script with precision timing control (optimized for speed + quality)"""
     try:
         # Voice-specific timing adjustments (words per minute)
         voice_timing = {
@@ -317,23 +317,15 @@ def generate_script_with_precision(articles: List[Dict], topics: List[str], lang
         articles_text = ""
         for article in articles[:3]:  # Limit to 3 articles for speed
             title = article.get("title", "")
-            content = article.get("content", "")[:500]  # Limit content length
+            content = article.get("content", "")[:300]  # Limit content length for speed
             url = article.get("url", "")
             topic = article.get("topic", "")
             
             articles_text += f"Topic: {topic}\nTitle: {title}\nContent: {content}\nURL: {url}\n\n"
         
-        for iteration in range(max_iterations):
-            print(f"🔄 Iteration {iteration + 1}: Targeting {target_words} words")
-            
-            # Adjust prompt based on iteration (more aggressive for speed)
-            if iteration == 0:
-                duration_instruction = f"Create a {target_duration_minutes}-minute news bulletin"
-            else:
-                duration_instruction = f"Create a MUCH SHORTER news bulletin - be very concise, target exactly {target_duration_minutes} minutes"
-            
-            prompt = f"""
-You are Noah, a professional news anchor. {duration_instruction} in {language} with a {tone} tone.
+        # Single iteration approach for speed
+        prompt = f"""
+You are Noah, a professional news anchor. Create a {target_duration_minutes}-minute news bulletin in {language} with a {tone} tone.
 
 Your mission: Provide busy professionals with SPECIFIC, RECENT updates on their requested topics. Focus on what happened in the last 24 hours, not general overviews.
 
@@ -343,7 +335,7 @@ Available news articles (ranked by relevance and recency):
 {articles_text}
 
 CRITICAL REQUIREMENTS:
-1. Target EXACTLY {target_words} words (±10 words) - THIS IS CRITICAL FOR TIMING
+1. Target EXACTLY {target_words} words (±15 words) - THIS IS CRITICAL FOR TIMING
 2. Focus on SPECIFIC developments, announcements, and breaking news from the last 24 hours
 3. Avoid generic overviews, explanations, or background information
 4. Lead with the most recent and relevant updates first
@@ -354,51 +346,37 @@ CRITICAL REQUIREMENTS:
 9. Each update should be actionable and informative
 10. Be precise with word count - this is for exact timing control
 
-CONTENT EXPANSION STRATEGIES (when news is limited):
-- Add detailed analysis of each development
-- Include "why this matters" explanations
-- Connect developments to broader industry trends
-- Add relevant context and implications
-- Explain potential future impacts
-- Include expert opinions or market reactions
-- Provide historical context when relevant
-
-Current target: {target_words} words for {target_duration_minutes} minutes.
-
 Format: Start with "Good [time], I'm Noah with your {target_duration_minutes}-minute briefing on [topics]." Then deliver specific updates, ending with "That concludes your briefing. Stay informed."
 
-Focus on WHAT HAPPENED, not what things are. If you have limited news, expand on what you have rather than adding generic content.
+Focus on WHAT HAPPENED, not what things are. Target {target_words} words for {target_duration_minutes} minutes.
 """
 
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,  # Reduced for speed
-                temperature=0.7
-            )
-            
-            script = response.choices[0].message.content.strip()
-            actual_words = len(script.split())
-            
-            print(f"📝 Generated: {actual_words} words (target: {target_words})")
-            
-            # Check if we're close enough (more lenient for speed)
-            if abs(actual_words - target_words) <= 20:  # Allow 20 word tolerance
-                print(f"✅ Word count within tolerance: {actual_words} vs {target_words}")
-                return script, actual_words
-            
-            # Adjust target for next iteration (more aggressive)
-            if actual_words > target_words:
-                target_words = int(target_words * 0.80)  # Reduce by 20%
-            else:
-                target_words = int(target_words * 1.20)  # Increase by 20%
+        print(f"🚀 Generating script (single iteration for speed)...")
         
-        print(f"⚠️ Max iterations reached, using final script with {len(script.split())} words")
-        return script, len(script.split())
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1500,  # Reduced for speed
+            temperature=0.7
+        )
+        
+        script = response.choices[0].message.content.strip()
+        actual_words = len(script.split())
+        
+        print(f"📝 Generated: {actual_words} words (target: {target_words})")
+        
+        # Check if we're close enough (lenient for speed)
+        if abs(actual_words - target_words) <= 25:  # Allow 25 word tolerance
+            print(f"✅ Word count within tolerance: {actual_words} vs {target_words}")
+            return script, actual_words
+        else:
+            print(f"⚠️ Word count outside tolerance but proceeding for speed: {actual_words} vs {target_words}")
+            return script, actual_words
         
     except Exception as e:
-        print(f"Error generating script with precision: {e}")
-        return f"Welcome to Noah. Here's your {target_duration_minutes}-minute briefing on {', '.join(topics)}. Unfortunately, there was an error generating the content. Please try again later.", 0
+        print(f"❌ Error in generate_script_with_precision: {e}")
+        # Fallback to basic generation
+        return generate_script(articles, topics, language, target_duration_minutes, tone), 0
 
 def expand_content_for_duration(script: str, target_duration_minutes: float, voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> str:
     """Expand content to fill the requested duration when news is limited"""

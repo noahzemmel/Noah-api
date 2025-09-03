@@ -310,7 +310,21 @@ def show_noah_interface():
             st.stop()
         
         try:
-            status.info("🔄 Generating your news bulletin...")
+            # Create progress tracking UI
+            progress_container = st.empty()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            time_container = st.empty()
+            
+            # Simulate progress steps
+            progress_steps = [
+                (10, "🔄 Initializing..."),
+                (20, "📰 Fetching latest news..."),
+                (40, "🤖 Generating script..."),
+                (70, "🎙️ Creating audio..."),
+                (90, "✨ Finalizing bulletin..."),
+                (100, "✅ Complete!")
+            ]
             
             # Prepare payload for simplified API
             payload = {
@@ -323,12 +337,56 @@ def show_noah_interface():
                 "quick_test": quick_test
             }
             
-            # Call the API
-            response = requests.post(f"{API_BASE}/generate", json=payload, timeout=300)  # Increased to 5 minutes
+            # Start the API call in a thread (simplified approach)
+            import threading
+            import queue
             
-            response.raise_for_status()
+            result_queue = queue.Queue()
+            error_queue = queue.Queue()
             
-            result = response.json()
+            def make_api_call():
+                try:
+                    response = requests.post(f"{API_BASE}/generate", json=payload, timeout=300)
+                    response.raise_for_status()
+                    result_queue.put(response.json())
+                except Exception as e:
+                    error_queue.put(e)
+            
+            # Start API call
+            api_thread = threading.Thread(target=make_api_call)
+            api_thread.start()
+            
+            # Show progress while waiting
+            start_time = time.time()
+            step_index = 0
+            
+            while api_thread.is_alive():
+                # Update progress
+                if step_index < len(progress_steps):
+                    progress_percent, step_text = progress_steps[step_index]
+                    progress_bar.progress(progress_percent / 100)
+                    status_text.info(step_text)
+                    
+                    # Show elapsed time
+                    elapsed = int(time.time() - start_time)
+                    time_container.info(f"⏱️ Elapsed time: {elapsed} seconds")
+                    
+                    # Move to next step every 10-15 seconds
+                    if elapsed > (step_index + 1) * 12:
+                        step_index += 1
+                
+                time.sleep(1)
+            
+            # Wait for result
+            api_thread.join()
+            
+            # Get result or error
+            if not result_queue.empty():
+                result = result_queue.get()
+            elif not error_queue.empty():
+                raise error_queue.get()
+            else:
+                raise Exception("No result received from API")
             
             if result.get("status") == "success":
                 status.success("✅ Bulletin generated successfully!")

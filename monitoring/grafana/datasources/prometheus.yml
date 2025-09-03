@@ -1,0 +1,19 @@
+# monitoring/grafana/datasources/prometheus.yml - Grafana Data Source Configuration
+"""
+🚀 DAILY NOAH ADVANCED GRAFANA DATASOURCE
+Advanced monitoring data source configuration for comprehensive system insights.
+"""
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "5s"
+      queryTimeout: "60s"
+      httpMethod: "POST"

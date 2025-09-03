@@ -1,0 +1,272 @@
+# docker-compose.advanced.yml - World-Class Daily Noah Orchestration
+"""
+🚀 DAILY NOAH ADVANCED DOCKER COMPOSE
+The most sophisticated orchestration for the world's most advanced AI briefing system.
+
+Services:
+- Daily Noah Advanced API
+- Redis for intelligent caching
+- PostgreSQL for data persistence
+- Prometheus for metrics
+- Grafana for monitoring
+- Nginx for load balancing
+- Elasticsearch for logging
+- Kibana for log analysis
+"""
+
+version: '3.8'
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  noah-advanced:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+
+volumes:
+  # Database persistence
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  
+  # Application data
+  noah_audio:
+    driver: local
+  noah_logs:
+    driver: local
+  noah_cache:
+    driver: local
+  
+  # Monitoring data
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  
+  # Logging data
+  elasticsearch_data:
+    driver: local
+  kibana_data:
+    driver: local
+
+# ============================================================================
+# SERVICES
+# ============================================================================
+
+services:
+  # ============================================================================
+  # DAILY NOAH ADVANCED API
+  # ============================================================================
+  
+  noah-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.advanced
+    container_name: noah-api-advanced
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "9090:9090"  # Prometheus metrics
+    environment:
+      - NOAH_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://noah:noah_password@postgres:5432/noah_db
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    volumes:
+      - noah_audio:/app/audio
+      - noah_logs:/app/logs
+      - noah_cache:/app/cache
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - noah-advanced
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ============================================================================
+  # REDIS CACHE
+  # ============================================================================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: noah-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - noah-advanced
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # POSTGRESQL DATABASE
+  # ============================================================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: noah-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=noah_db
+      - POSTGRES_USER=noah
+      - POSTGRES_PASSWORD=noah_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - noah-advanced
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noah -d noah_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # PROMETHEUS METRICS
+  # ============================================================================
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: noah-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - noah-advanced
+
+  # ============================================================================
+  # GRAFANA MONITORING
+  # ============================================================================
+  
+  grafana:
+    image: grafana/grafana:latest
+    container_name: noah-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - noah-advanced
+
+  # ============================================================================
+  # ELASTICSEARCH LOGGING
+  # ============================================================================
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+    container_name: noah-elasticsearch
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - noah-advanced
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # KIBANA LOG ANALYSIS
+  # ============================================================================
+  
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.10.0
+    container_name: noah-kibana
+    restart: unless-stopped
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - noah-advanced
+
+  # ============================================================================
+  # NGINX LOAD BALANCER
+  # ============================================================================
+  
+  nginx:
+    image: nginx:alpine
+    container_name: noah-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - noah-api
+    networks:
+      - noah-advanced
+
+  # ============================================================================
+  # STREAMLIT FRONTEND
+  # ============================================================================
+  
+  noah-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.advanced
+    container_name: noah-frontend-advanced
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE=http://noah-api:8000
+    depends_on:
+      - noah-api
+    networks:
+      - noah-advanced
+    command: ["streamlit", "run", "app_advanced.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+# ============================================================================
+# MONITORING CONFIGURATION
+# ============================================================================
+
+# Create monitoring directories
+# mkdir -p monitoring/prometheus monitoring/grafana/dashboards monitoring/grafana/datasources monitoring/nginx monitoring/nginx/ssl

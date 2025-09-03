@@ -1,0 +1,488 @@
+# docker-compose.enterprise.yml - Enterprise-Grade Docker Compose for Daily Noah
+"""
+🚀 DAILY NOAH ENTERPRISE DOCKER COMPOSE
+The most advanced AI briefing system orchestration.
+
+Services:
+- Daily Noah Enterprise API
+- Redis for caching and sessions
+- PostgreSQL for data persistence
+- Prometheus for metrics
+- Grafana for monitoring
+- Nginx for load balancing
+- Elasticsearch for logging
+- Kibana for log analysis
+"""
+
+version: '3.8'
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  noah-enterprise:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+
+volumes:
+  # Database persistence
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  
+  # Application data
+  noah_audio:
+    driver: local
+  noah_logs:
+    driver: local
+  noah_cache:
+    driver: local
+  
+  # Monitoring data
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  
+  # Logging data
+  elasticsearch_data:
+    driver: local
+  kibana_data:
+    driver: local
+
+# ============================================================================
+# SERVICES
+# ============================================================================
+
+services:
+  # ============================================================================
+  # DAILY NOAH ENTERPRISE API
+  # ============================================================================
+  
+  noah-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.enterprise
+    container_name: noah-enterprise-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "9090:9090"  # Prometheus metrics
+    environment:
+      # Core configuration
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      
+      # Database
+      - DATABASE_URL=postgresql://noah:${POSTGRES_PASSWORD}@postgres:5432/noah_enterprise
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      
+      # API Keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      
+      # Performance
+      - MAX_CONCURRENT_GENERATIONS=10
+      - MAX_CONCURRENT_REQUESTS=100
+      - REQUEST_TIMEOUT=30
+      
+      # Caching
+      - CACHE_TTL=3600
+      - CACHE_MAX_SIZE=1000
+      
+      # Rate limiting
+      - RATE_LIMIT_REQUESTS=100
+      - RATE_LIMIT_WINDOW=3600
+      
+      # Monitoring
+      - ENABLE_METRICS=true
+      - METRICS_PORT=9090
+      - PROMETHEUS_URL=http://prometheus:9090
+      
+      # Logging
+      - ENABLE_STRUCTURED_LOGGING=true
+      - LOG_FORMAT=json
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      
+      # Security
+      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      
+      # File storage
+      - AUDIO_DIR=/app/audio
+      - MAX_AUDIO_SIZE=52428800
+      - AUDIO_RETENTION_DAYS=7
+      
+      # Analytics
+      - ENABLE_ANALYTICS=true
+      - ANALYTICS_RETENTION_DAYS=90
+    volumes:
+      - noah_audio:/app/audio
+      - noah_logs:/app/logs
+      - noah_cache:/app/cache
+    depends_on:
+      - postgres
+      - redis
+      - elasticsearch
+    networks:
+      - noah-enterprise
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # ============================================================================
+  # DATABASE SERVICES
+  # ============================================================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: noah-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=noah_enterprise
+      - POSTGRES_USER=noah
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - noah-enterprise
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U noah -d noah_enterprise"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    container_name: noah-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - noah-enterprise
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  # ============================================================================
+  # MONITORING SERVICES
+  # ============================================================================
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: noah-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - noah-enterprise
+    depends_on:
+      - noah-api
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: noah-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - noah-enterprise
+    depends_on:
+      - prometheus
+
+  # ============================================================================
+  # LOGGING SERVICES
+  # ============================================================================
+  
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: noah-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - noah-enterprise
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: noah-kibana
+    restart: unless-stopped
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    volumes:
+      - kibana_data:/usr/share/kibana/data
+    networks:
+      - noah-enterprise
+    depends_on:
+      - elasticsearch
+
+  # ============================================================================
+  # LOAD BALANCER
+  # ============================================================================
+  
+  nginx:
+    image: nginx:alpine
+    container_name: noah-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    networks:
+      - noah-enterprise
+    depends_on:
+      - noah-api
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================================================
+  # BACKGROUND WORKERS
+  # ============================================================================
+  
+  noah-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.enterprise
+    container_name: noah-enterprise-worker
+    restart: unless-stopped
+    command: celery -A noah_core_enterprise worker --loglevel=info
+    environment:
+      # Same environment as noah-api
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://noah:${POSTGRES_PASSWORD}@postgres:5432/noah_enterprise
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+    volumes:
+      - noah_audio:/app/audio
+      - noah_logs:/app/logs
+      - noah_cache:/app/cache
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - noah-enterprise
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ============================================================================
+  # SCHEDULER
+  # ============================================================================
+  
+  noah-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.enterprise
+    container_name: noah-enterprise-scheduler
+    restart: unless-stopped
+    command: celery -A noah_core_enterprise beat --loglevel=info
+    environment:
+      # Same environment as noah-api
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://noah:${POSTGRES_PASSWORD}@postgres:5432/noah_enterprise
+      - REDIS_URL=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - noah-enterprise
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  # ============================================================================
+  # BACKUP SERVICE
+  # ============================================================================
+  
+  backup:
+    image: postgres:15-alpine
+    container_name: noah-backup
+    restart: "no"
+    environment:
+      - POSTGRES_DB=noah_enterprise
+      - POSTGRES_USER=noah
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    command: |
+      sh -c '
+        while true; do
+          pg_dump -h postgres -U noah noah_enterprise > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql
+          find /backups -name "backup_*.sql" -mtime +7 -delete
+          sleep 86400
+        done
+      '
+    depends_on:
+      - postgres
+    networks:
+      - noah-enterprise
+
+# ============================================================================
+# ENVIRONMENT VARIABLES
+# ============================================================================
+
+# Create a .env file with the following variables:
+# POSTGRES_PASSWORD=your_secure_password
+# REDIS_PASSWORD=your_redis_password
+# SECRET_KEY=your_secret_key
+# JWT_SECRET_KEY=your_jwt_secret_key
+# GRAFANA_PASSWORD=your_grafana_password
+# OPENAI_API_KEY=your_openai_api_key
+# ELEVENLABS_API_KEY=your_elevenlabs_api_key
+# TAVILY_API_KEY=your_tavily_api_key
+# ALLOWED_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+
+# ============================================================================
+# DEPLOYMENT COMMANDS
+# ============================================================================
+
+# Start all services:
+# docker-compose -f docker-compose.enterprise.yml up -d
+
+# Start specific services:
+# docker-compose -f docker-compose.enterprise.yml up -d noah-api postgres redis
+
+# View logs:
+# docker-compose -f docker-compose.enterprise.yml logs -f noah-api
+
+# Scale services:
+# docker-compose -f docker-compose.enterprise.yml up -d --scale noah-worker=4
+
+# Stop all services:
+# docker-compose -f docker-compose.enterprise.yml down
+
+# Stop and remove volumes:
+# docker-compose -f docker-compose.enterprise.yml down -v
+
+# ============================================================================
+# MONITORING ENDPOINTS
+# ============================================================================
+
+# API Health: http://localhost:8000/health
+# API Metrics: http://localhost:9090/metrics
+# Prometheus: http://localhost:9091
+# Grafana: http://localhost:3000 (admin/${GRAFANA_PASSWORD})
+# Kibana: http://localhost:5601
+# Elasticsearch: http://localhost:9200
+
+# ============================================================================
+# PRODUCTION DEPLOYMENT
+# ============================================================================
+
+# For production deployment:
+# 1. Set all environment variables
+# 2. Configure SSL certificates
+# 3. Set up domain names
+# 4. Configure firewall rules
+# 5. Set up monitoring alerts
+# 6. Configure backup strategies
+# 7. Set up log rotation
+# 8. Configure auto-scaling
+# 9. Set up disaster recovery
+# 10. Perform security audit

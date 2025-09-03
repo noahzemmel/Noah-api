@@ -1,0 +1,60 @@
+# monitoring/prometheus.yml - Prometheus Configuration for Daily Noah Advanced
+"""
+🚀 DAILY NOAH ADVANCED PROMETHEUS CONFIG
+Advanced monitoring configuration for the world's most sophisticated AI briefing system.
+"""
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # ============================================================================
+  # DAILY NOAH API METRICS
+  # ============================================================================
+  
+  - job_name: 'noah-api'
+    static_configs:
+      - targets: ['noah-api:9090']
+    scrape_interval: 5s
+    metrics_path: '/metrics'
+    
+  # ============================================================================
+  # REDIS METRICS
+  # ============================================================================
+  
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 15s
+    
+  # ============================================================================
+  # POSTGRESQL METRICS
+  # ============================================================================
+  
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']
+    scrape_interval: 15s
+    
+  # ============================================================================
+  # NGINX METRICS
+  # ============================================================================
+  
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:80']
+    scrape_interval: 15s
+    
+  # ============================================================================
+  # NODE EXPORTER (SYSTEM METRICS)
+  # ============================================================================
+  
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s

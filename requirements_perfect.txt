@@ -1,0 +1,71 @@
+# requirements_perfect.txt - Launch-Ready Daily Noah Dependencies
+"""
+🚀 DAILY NOAH PERFECT REQUIREMENTS
+The most reliable dependency list for the world's most precise AI briefing system.
+
+Core Framework:
+- FastAPI for high-performance API
+- Streamlit for perfect frontend
+- Uvicorn for production ASGI server
+
+AI & ML:
+- OpenAI for GPT-4 content generation
+- ElevenLabs for professional TTS
+- Tavily for real-time news fetching
+
+Perfect Features:
+- Precise timing accuracy
+- Recent 24-48 hour news focus
+- Deep insights and analysis
+- Bulletproof error handling
+- Production-ready reliability
+"""
+
+# ============================================================================
+# CORE FRAMEWORK
+# ============================================================================
+
+# FastAPI and ASGI
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart>=0.0.6
+
+# Streamlit
+streamlit==1.36.0
+
+# ============================================================================
+# AI & MACHINE LEARNING
+# ============================================================================
+
+# OpenAI for GPT-4
+openai>=1.40.0,<2
+
+# ElevenLabs for TTS
+requests>=2.31.0
+
+# Tavily for news
+tavily-python>=0.3.0
+
+# ============================================================================
+# DATA PROCESSING
+# ============================================================================
+
+# Date/time handling
+python-dateutil>=2.8.2
+
+# ============================================================================
+# ENVIRONMENT & CONFIG
+# ============================================================================
+
+# Environment management
+python-dotenv>=1.0.1
+
+# ============================================================================
+# PRODUCTION DEPLOYMENT
+# ============================================================================
+
+# Process management
+gunicorn>=21.2.0
+
+# Health checks
+psutil>=5.9.0

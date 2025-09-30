@@ -1,24 +1,64 @@
-# Core web framework
+# requirements.txt - Render Deployment Requirements (Lightning Fast)
+"""
+⚡ DAILY NOAH LIGHTNING REQUIREMENTS FOR RENDER
+The fastest, most reliable AI briefing generation system.
+
+This is the main requirements file that Render will use for deployment.
+It includes all dependencies for the lightning-fast system.
+"""
+
+# ============================================================================
+# CORE FRAMEWORK
+# ============================================================================
+
+# FastAPI and ASGI
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
-
-# HTTP requests
-requests>=2.31.0
-
-# AI and ML
-openai>=1.40.0,<2
-tavily-python>=0.3.0
-
-# Frontend
-streamlit==1.36.0
-
-# Audio processing (Python 3.13 compatible)
-pydub>=0.25.1
-# Note: pyaudioop is not available in Python 3.13, but pydub has fallbacks
-
-# Environment and utilities
-python-dotenv>=1.0.1
 python-multipart>=0.0.6
 
-# Date parsing
+# Streamlit
+streamlit==1.36.0
+
+# ============================================================================
+# AI & MACHINE LEARNING
+# ============================================================================
+
+# OpenAI for GPT-4
+openai>=1.40.0,<2
+
+# ElevenLabs for TTS
+requests>=2.31.0
+
+# Tavily for news
+tavily-python>=0.3.0
+
+# ============================================================================
+# ASYNC & PERFORMANCE
+# ============================================================================
+
+# Async HTTP client
+aiohttp>=3.8.0
+
+# ============================================================================
+# DATA PROCESSING
+# ============================================================================
+
+# Date/time handling
 python-dateutil>=2.8.2
+
+# ============================================================================
+# ENVIRONMENT & CONFIG
+# ============================================================================
+
+# Environment management
+python-dotenv>=1.0.1
+
+# ============================================================================
+# PRODUCTION DEPLOYMENT
+# ============================================================================
+
+# Process management
+gunicorn>=21.2.0
+
+# Health checks
+psutil>=5.9.0

@@ -1,10 +1,10 @@
-# requirements.txt - Render Deployment Requirements (Lightning Fast)
+# requirements.txt - Render Deployment Requirements (Optimized)
 """
-⚡ DAILY NOAH LIGHTNING REQUIREMENTS FOR RENDER
-The fastest, most reliable AI briefing generation system.
+🎯 DAILY NOAH OPTIMIZED REQUIREMENTS FOR RENDER
+Perfect balance of speed, quality, and timing accuracy.
 
 This is the main requirements file that Render will use for deployment.
-It includes all dependencies for the lightning-fast system.
+It includes all dependencies for the optimized system.
 """
 
 # ============================================================================
@@ -45,6 +45,9 @@ aiohttp>=3.8.0
 
 # Date/time handling
 python-dateutil>=2.8.2
+
+# Audio processing
+pydub>=0.25.1
 
 # ============================================================================
 # ENVIRONMENT & CONFIG

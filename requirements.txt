@@ -1,11 +1,9 @@
 # requirements.txt - Render Deployment Requirements (Optimized)
-"""
-🎯 DAILY NOAH OPTIMIZED REQUIREMENTS FOR RENDER
-Perfect balance of speed, quality, and timing accuracy.
-
-This is the main requirements file that Render will use for deployment.
-It includes all dependencies for the optimized system.
-"""
+# 🎯 DAILY NOAH OPTIMIZED REQUIREMENTS FOR RENDER
+# Perfect balance of speed, quality, and timing accuracy.
+#
+# This is the main requirements file that Render will use for deployment.
+# It includes all dependencies for the optimized system.
 
 # ============================================================================
 # CORE FRAMEWORK
